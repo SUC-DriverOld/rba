@@ -3,8 +3,8 @@ name = "rba"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Rust BPM Analyzer: Rust rewrite of the MixMeister BPM Analyzer core"
-license = "MIT"
+description = "Rust BPM & Key Analyzer: A cross-platform tool that detects the tempo and the musical key of audio files"
+license = "GPL-3.0"
 
 [[bin]]
 name = "rba"

@@ -6,24 +6,26 @@ use crate::analyze::Analysis;
 
 const HEADER_FILE: &str = "FILE";
 const HEADER_BPM: &str = "BPM";
+const HEADER_KEY: &str = "KEY";
 /// Gap between the two columns.
 const COLUMN_GAP: &str = "  ";
 
 /// Print one analysis result.
 ///
 /// Names the file and labels the unit: a bare number on its own is easy to
-/// misread, especially when the command was run a while ago. Detail goes to
-/// stderr under `--verbose`.
-pub fn print_single(a: &Analysis, verbose: bool) {
+/// misread, especially when the command was run a while ago.
+pub fn print_single(a: &Analysis) {
+    // The KEY field is absent only when --nokey suppressed the key pass.
+    let tail = match &a.key {
+        Some(key) => format!("\tKEY: {key}"),
+        None => String::new(),
+    };
     if !a.name.is_empty() {
-        println!("{}\tBPM: {:.2}", a.name, a.bpm);
+        println!("{}\tBPM: {:.2}{}", a.name, a.bpm, tail);
+    } else {
+        println!("BPM: {:.2}{}", a.bpm, tail);
     }
-    else{
-        println!("BPM: {:.2}", a.bpm);
-    }
-    if verbose {
-        eprint!("{}", details(a));
-    }
+    eprint!("{}", details(a));
 }
 
 /// Human-readable breakdown, written to stderr.
@@ -42,7 +44,8 @@ pub fn details(a: &Analysis) -> String {
          \x20 base BPM (0.1)  : {:.2}\n\
          \x20 after fold-up   : {:.2}\n\
          \x20 refined         : {}\n\
-         \x20 short-clip rule : {}\n",
+         \x20 short-clip rule : {}\n\
+         \x20 key             : {}\n",
         a.name,
         a.sample_count,
         a.duration,
@@ -55,6 +58,7 @@ pub fn details(a: &Analysis) -> String {
         a.trace.folded_bpm,
         refinement,
         if a.trace.short_clip_applied { "applied" } else { "n/a" },
+        a.trace.key_detected,
     )
 }
 
@@ -83,6 +87,14 @@ fn bpm_cell(row: &Row) -> String {
 
 /// Pad on the right to `width` **display columns** (not chars, so CJK names
 /// stay aligned).
+/// The KEY cell, or `-` for a key that was not requested or a failed file.
+fn key_cell(row: &Row) -> String {
+    match row {
+        Row::Ok(a) => a.key.clone().unwrap_or_else(|| "-".to_string()),
+        Row::Failed { .. } => "-".to_string(),
+    }
+}
+
 fn pad_right(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(width.saturating_sub(s.width())))
 }
@@ -94,7 +106,7 @@ fn pad_left(s: &str, width: usize) -> String {
 
 /// Render the directory report: a plain `FILE / BPM` table, plus a short list of
 /// reasons underneath if anything failed.
-pub fn render_table(rows: &[Row]) -> String {
+pub fn render_table(rows: &[Row], show_key: bool) -> String {
     let name_w = rows
         .iter()
         .map(|r| r.name().width())
@@ -108,20 +120,41 @@ pub fn render_table(rows: &[Row]) -> String {
         .max()
         .unwrap_or(HEADER_BPM.len());
 
+    let key_w = rows
+        .iter()
+        .map(|r| key_cell(r).width())
+        .chain(std::iter::once(HEADER_KEY.width()))
+        .max()
+        .unwrap_or(HEADER_KEY.len());
+
+    // Trailing padding is stripped so the output matches the Python reference
+    // byte for byte.
+    let row_line = |name: &str, bpm: &str, key: &str| {
+        let mut line = format!(
+            "{}{COLUMN_GAP}{}",
+            pad_right(name, name_w),
+            pad_left(bpm, bpm_w)
+        );
+        if show_key {
+            line.push_str(COLUMN_GAP);
+            line.push_str(&pad_right(key, key_w));
+        }
+        line.trim_end().to_string()
+    };
+
     let mut out = String::new();
-    out.push_str(&pad_right(HEADER_FILE, name_w));
-    out.push_str(COLUMN_GAP);
-    out.push_str(&pad_left(HEADER_BPM, bpm_w));
+    out.push_str(&row_line(HEADER_FILE, HEADER_BPM, HEADER_KEY));
     out.push('\n');
-    out.push_str(&"-".repeat(name_w));
-    out.push_str(COLUMN_GAP);
-    out.push_str(&"-".repeat(bpm_w));
+    let mut rule = format!("{}{COLUMN_GAP}{}", "-".repeat(name_w), "-".repeat(bpm_w));
+    if show_key {
+        rule.push_str(COLUMN_GAP);
+        rule.push_str(&"-".repeat(key_w));
+    }
+    out.push_str(rule.trim_end());
     out.push('\n');
 
     for row in rows {
-        out.push_str(&pad_right(row.name(), name_w));
-        out.push_str(COLUMN_GAP);
-        out.push_str(&pad_left(&bpm_cell(row), bpm_w));
+        out.push_str(&row_line(row.name(), &bpm_cell(row), &key_cell(row)));
         out.push('\n');
     }
 
@@ -158,6 +191,7 @@ mod tests {
             sample_count: 44100,
             sample_rate: 44100,
             duration: 1.0,
+            key: Some("C minor".to_string()),
             trace: Trace::default(),
         }
     }
@@ -172,7 +206,7 @@ mod tests {
                 message: "decoder exploded".into(),
             },
         ];
-        let t = render_table(&rows);
+        let t = render_table(&rows, true);
         assert!(t.contains("FILE"));
         assert!(t.contains("BPM"));
         assert!(t.contains("120.00"));
@@ -186,7 +220,7 @@ mod tests {
     #[test]
     fn successful_run_has_no_failure_section() {
         let rows = vec![Row::Ok(mk("a.wav", 120.0))];
-        let t = render_table(&rows);
+        let t = render_table(&rows, true);
         assert!(!t.contains("FAILED"));
         assert!(!t.contains("could not be analyzed"));
     }
@@ -197,23 +231,30 @@ mod tests {
             name: "x.wav".into(),
             message: "boom".into(),
         }];
-        let t = render_table(&rows);
+        let t = render_table(&rows, true);
         assert!(t.contains("1 file could not be analyzed"), "{t}");
     }
 
     #[test]
     fn the_rule_matches_the_column_widths() {
         let rows = vec![Row::Ok(mk("a.wav", 120.0))];
-        let rendered = render_table(&rows);
+        let rendered = render_table(&rows, true);
         let lines: Vec<&str> = rendered.lines().collect();
         // Header, rule, one row.
         assert_eq!(lines.len(), 3);
         let (header, rule, row) = (lines[0], lines[1], lines[2]);
-        assert_eq!(header.len(), rule.len(), "rule must span the header");
-        assert_eq!(header.len(), row.len(), "row must line up with the header");
         assert!(rule.starts_with("---"), "rule: {rule}");
         assert!(rule.contains("  "), "rule: {rule}");
         assert!(!rule.contains('+'), "plain dashes only: {rule}");
+        // Trailing padding is stripped, so compare field offsets rather than
+        // whole-line lengths. BPM is right-aligned (compare ends); KEY is
+        // left-aligned (compare starts).
+        assert_eq!(
+            header.find("BPM").unwrap() + 3,
+            row.find("120.00").unwrap() + 6,
+            "row: {row}"
+        );
+        assert_eq!(header.find("KEY"), row.find("C minor"), "row: {row}");
     }
 
     #[test]
@@ -222,13 +263,14 @@ mod tests {
             Row::Ok(mk("short.wav", 90.0)),
             Row::Ok(mk("a_much_longer_name.wav", 120.25)),
         ];
-        let rendered = render_table(&rows);
+        let rendered = render_table(&rows, true);
         let lines: Vec<&str> = rendered.lines().collect();
-        // BPM is the last column and right-aligned, so every value *ends* in
-        // the same column as the header's.
+        // BPM is right-aligned, so every value ends in the same column.
         let bpm_end = lines[0].find("BPM").expect("header has BPM") + "BPM".len();
         for line in &lines[2..] {
-            assert_eq!(line.len(), bpm_end, "line: {line}");
+            let bpm = line.split_whitespace().nth(1).expect("bpm field");
+            let at = line.find(bpm).expect("bpm in line");
+            assert_eq!(at + bpm.len(), bpm_end, "line: {line:?}");
         }
     }
 }

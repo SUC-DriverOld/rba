@@ -26,6 +26,8 @@ pub struct Config {
     pub sample_rate: u32,
     /// Emit extra detail on stderr.
     pub verbose: bool,
+    /// Run the key pass. On by default; `--nokey` turns it off.
+    pub find_key: bool,
 }
 
 impl Config {
@@ -34,6 +36,7 @@ impl Config {
         ffprobe: Option<PathBuf>,
         sample_rate: u32,
         verbose: bool,
+        find_key: bool,
     ) -> Self {
         Config {
             ffmpeg: ffmpeg.unwrap_or_else(|| PathBuf::from("ffmpeg")),
@@ -44,6 +47,7 @@ impl Config {
                 sample_rate
             },
             verbose,
+            find_key,
         }
     }
 
@@ -59,6 +63,6 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config::new(None, None, DEFAULT_SAMPLE_RATE, false)
+        Config::new(None, None, DEFAULT_SAMPLE_RATE, false, false)
     }
 }

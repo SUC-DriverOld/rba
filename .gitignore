@@ -23,3 +23,5 @@ tests/
 docs/
 protos/
 re/
+libkeyfinder/
+tools/

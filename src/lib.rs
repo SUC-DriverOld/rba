@@ -1,11 +1,16 @@
-//! `rba` — BPM analyzer.
+//! `rba` — BPM & key analyzer.
 //!
-//! A Rust rewrite of the analysis core of the 2008 macOS application
-//! *MixMeister BPM Analyzer*. The original source is lost; this crate is a
-//! direct port of the behaviour recovered by static analysis of the binary.
+//! The tempo half is a Rust rewrite of the analysis core of the 2008 macOS
+//! application *MixMeister BPM Analyzer*. The original source is lost; this
+//! crate is a direct port of the behaviour recovered by static analysis of the
+//! binary.
 //!
-//! * Recovered algorithm: `docs/02-algorithm-spec.md`
-//! * How it was recovered: `docs/01-reverse-engineering.md`
+//! The key half is a port of *libKeyFinder* (GPL-3.0), which is vendored under
+//! `libKeyFinder/`.
+//!
+//! * Recovered tempo algorithm: `docs/02-algorithm-spec.md`
+//! * Key algorithm: `docs/02-algorithm-spec.md` §13
+//! * How the tempo was recovered: `docs/01-reverse-engineering.md`
 //! * Raw decompilation evidence: `re/`
 //!
 //! # Dependencies
@@ -24,6 +29,7 @@ pub mod detect;
 pub mod error;
 pub mod fft;
 pub mod impact;
+pub mod keyfinder;
 pub mod report;
 pub mod thumbnail;
 

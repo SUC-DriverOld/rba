@@ -31,20 +31,21 @@ pub const EXIT_RUNTIME: u8 = 1;
 
 const AFTER_HELP: &str = "\
 OUTPUT:
-    A single file names the file and prints its tempo (2 decimals).
-    A directory prints a FILE/BPM table, then a note for anything that failed.
+    A single file names the file, its tempo (2 decimals) and its key.
+    A directory prints a FILE/BPM/KEY table, then a note for anything that failed.
+    --nokey drops the key column and skips that pass.
 
 ENVIRONMENT:
     RBA_FFMPEG           ffmpeg executable        (alias: rba_ffmpeg)
     RBA_FFPROBE          ffprobe executable       (alias: rba_ffprobe)
     RBA_SAMPLE_RATE      analysis rate in Hz      (alias: rba_sample_rate)";
 
-/// BPM analyzer — a Rust rewrite of the MixMeister BPM Analyzer core.
+/// BPM & key analyzer — the MixMeister BPM Analyzer core plus libKeyFinder.
 #[derive(Debug, Parser)]
 #[command(
     name = "rba",
     version,
-    about = "BPM analyzer — a Rust rewrite of the MixMeister BPM Analyzer core",
+    about = "BPM & key analyzer — the MixMeister BPM Analyzer core plus libKeyFinder",
     after_help = AFTER_HELP
 )]
 pub struct Cli {
@@ -55,6 +56,10 @@ pub struct Cli {
     /// Print pipeline detail to stderr
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Skip key detection (BPM only)
+    #[arg(long)]
+    pub nokey: bool,
 
     /// Recurse into subdirectories when PATH is a directory
     #[arg(short, long)]
@@ -97,6 +102,7 @@ impl Cli {
             self.ffprobe.clone(),
             self.sample_rate,
             self.verbose,
+            !self.nokey,
         )
     }
 }
@@ -198,7 +204,7 @@ fn dispatch(cli: &Cli, cfg: &Config) -> Result<ExitCode> {
 
 fn run_file(path: &Path, cfg: &Config) -> Result<ExitCode> {
     let a = analyze::analyze_file(path, cfg)?;
-    report::print_single(&a, cfg.verbose);
+    report::print_single(&a);
     Ok(ExitCode::from(EXIT_OK))
 }
 
@@ -244,7 +250,7 @@ fn run_directory(dir: &Path, cfg: &Config, recursive: bool) -> Result<ExitCode> 
         }
     }
 
-    print!("{}", report::render_table(&rows));
+    print!("{}", report::render_table(&rows, cfg.find_key));
 
     let failed = rows
         .iter()

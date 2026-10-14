@@ -9,6 +9,7 @@ use crate::config::{Config, FFT_SIZE};
 use crate::detect;
 use crate::error::{Error, Result};
 use crate::impact::{self, ImpactPoints};
+use crate::keyfinder;
 use crate::thumbnail::{self, Thumbnail};
 
 /// Result of analysing one input.
@@ -27,6 +28,8 @@ pub struct Analysis {
     pub sample_rate: u32,
     /// Duration in seconds.
     pub duration: f64,
+    /// libKeyFinder key name, e.g. `"G major"`; `None` when `--nokey` was given.
+    pub key: Option<String>,
     /// Intermediate values, for `--verbose` and tests.
     pub trace: Trace,
 }
@@ -47,10 +50,12 @@ pub struct Trace {
     /// How many onsets the refinement fit.
     pub refine_onsets: usize,
     pub short_clip_applied: bool,
+    /// Key reported by the libKeyFinder port, for `--verbose` (spec §13).
+    pub key_detected: String,
 }
 
 /// Analyse an already-decoded mono buffer.
-pub fn analyze_samples(samples: &[f32], sample_rate: u32) -> Analysis {
+pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Analysis {
     let total_samples = samples.len() as i64;
 
     // ── ② spectral thumbnail ────────────────────────────────────────────
@@ -88,6 +93,10 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32) -> Analysis {
         (refined, Some(refined), kept)
     };
 
+    // ── ⑩ key: the libKeyFinder chain (spec §13) ───────────────────────
+    let key = find_key.then(|| keyfinder::detect_key(samples, sample_rate));
+    let key_detected = key.clone().unwrap_or_else(|| "not requested".to_string());
+
     let duration = if sample_rate == 0 {
         0.0
     } else {
@@ -100,6 +109,7 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32) -> Analysis {
         sample_count: total_samples,
         sample_rate,
         duration,
+        key,
         trace: Trace {
             thumbnail_elements: spec.len(),
             peak_hold_decay_div: peak.ele_per_meas(164.0) >> 4,
@@ -110,6 +120,7 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32) -> Analysis {
             refined_bpm,
             refine_onsets,
             short_clip_applied: is_short,
+            key_detected,
         },
     }
 }
@@ -120,7 +131,7 @@ pub fn analyze_file(path: &Path, cfg: &Config) -> Result<Analysis> {
     if samples.len() < FFT_SIZE {
         return Err(Error::EmptyAudio(path.to_path_buf()));
     }
-    let mut a = analyze_samples(&samples, cfg.sample_rate);
+    let mut a = analyze_samples(&samples, cfg.sample_rate, cfg.find_key);
     a.name = display_name(path);
     Ok(a)
 }
@@ -144,13 +155,13 @@ mod tests {
     #[test]
     fn silence_does_not_panic() {
         let samples = vec![0f32; 44100 * 5];
-        let a = analyze_samples(&samples, 44100);
+        let a = analyze_samples(&samples, 44100, false);
         assert!(a.bpm.is_finite(), "bpm = {}", a.bpm);
     }
 
     #[test]
     fn empty_buffer_is_safe() {
-        let a = analyze_samples(&[], 44100);
+        let a = analyze_samples(&[], 44100, false);
         assert_eq!(a.sample_count, 0);
         assert_eq!(a.trace.thumbnail_elements, 0);
     }
