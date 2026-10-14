@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+
+# Python virtualenv used by the prototype / fixture generator
+/.venv/
+
+# IDA database files (large, machine specific)
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# macOS
+.DS_Store
+._*
+
+# Cargo lock is committed for a binary crate; keep it.
+
+__pycache__/
+tests/
+docs/
+protos/
+re/

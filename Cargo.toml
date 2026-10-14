@@ -1,0 +1,40 @@
+[package]
+name = "rba"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust BPM Analyzer: Rust rewrite of the MixMeister BPM Analyzer core"
+license = "MIT"
+
+[[bin]]
+name = "rba"
+path = "src/main.rs"
+
+[lib]
+name = "rba"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI parsing: args, --help/--version, usage errors, env fallbacks.
+clap = { version = "4.5.61", features = ["derive", "env"] }
+# Progress bar for directory mode (stderr, TTY only).
+indicatif = "0.18.4"
+# Parallel analysis of many files.
+rayon = "1.10.0"
+# Forward FFT. The engine only needs a 256-point transform, but rustfft is
+# significantly faster than a hand-rolled radix-2 implementation on the hot
+# path (one transform per 256-sample frame) and is SIMD-accelerated on
+# aarch64/x86-64. See docs/03-implementation.md §2.3.
+rustfft = "6.4"
+# Error boilerplate.
+thiserror = "2.0.20"
+# Display width for the directory table (CJK-aware column alignment).
+unicode-width = "0.2"
+# Directory traversal for directory mode.
+walkdir = "2.5.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
