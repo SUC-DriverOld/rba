@@ -253,21 +253,30 @@ pub fn refine_bpm(onsets: &ImpactPoints, bpm: f32, sample_rate: u32) -> (f64, us
         }
         let tol = period / 4.0;
 
-        // Sufficient statistics for a least-squares fit of (k, p) with intercept.
+        // Weighted least squares of (k, p) with intercept. The weight tapers to
+        // zero at the gate rather than cutting off, so an onset landing exactly
+        // on the boundary cannot flip the fit. A hard gate is discontinuous
+        // there, and the two implementations' onset positions can differ by a
+        // sample (rustfft's f32 spectra vs scipy's), which used to move the
+        // result by ~0.01 BPM.
         let (mut n, mut sk, mut sp, mut skk, mut skp) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        let mut count = 0usize;
         for &p in &onsets.points {
             let pf = p as f64;
             let k = (pf / period).round();
-            if (pf - k * period).abs() >= tol {
+            let u = (pf - k * period).abs() / tol;
+            if u >= 1.0 {
                 continue;
             }
-            n += 1.0;
-            sk += k;
-            sp += pf;
-            skk += k * k;
-            skp += k * pf;
+            count += 1;
+            let w = (1.0 - u * u).powi(2);
+            n += w;
+            sk += w * k;
+            sp += w * pf;
+            skk += w * k * k;
+            skp += w * k * pf;
         }
-        kept = n as usize;
+        kept = count;
         if n < 4.0 {
             return (coarse, kept);
         }

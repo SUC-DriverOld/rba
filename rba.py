@@ -415,11 +415,11 @@ def refine_bpm(onsets, bpm: float, sample_rate: int) -> tuple[float, int]:
     Method
     ------
     Anchor on the coarse beat period ``T0 = 60*sr/bpm``. Give each onset a beat
-    index ``k = round(p / T0)`` and keep those whose residual to that grid is
-    under a quarter beat -- that rejects syncopated off-beats and half-beats.
-    Then fit ``p ~= phase + k*T`` by least squares, and iterate: once the first
-    pass tightens the period, beats that had drifted outside the gate come back
-    in.
+    index ``k = round(p / T0)`` and weight each one by how close it sits to that
+    grid, tapering to zero at a quarter beat -- that rejects syncopated off-beats
+    and half-beats without a hard cut-off. Then fit ``p ~= phase + k*T`` by
+    weighted least squares, and iterate: once the first pass tightens the
+    period, beats that had drifted outside the gate come back in.
 
     Returns ``(bpm, kept_onsets)``, falling back to the coarse value when the fit
     is unsupported or moves more than 5 %.
@@ -438,17 +438,23 @@ def refine_bpm(onsets, bpm: float, sample_rate: int) -> tuple[float, int]:
     for _ in range(4):
         if not np.isfinite(period) or period <= 0.0:
             return coarse, kept
+        tol = period / 4.0
         k = np.round(p / period)
-        keep = np.abs(p - k * period) < period / 4.0
-        k2, p2 = k[keep], p[keep]
-        kept = int(k2.size)
-        if k2.size < 4:
+        # Tapered weight rather than a hard gate: an onset sitting exactly on the
+        # boundary would otherwise flip the fit, and the two implementations'
+        # onset positions can differ by a sample (rustfft f32 vs scipy). See
+        # src/detect.rs.
+        u = np.abs(p - k * period) / tol
+        keep = u < 1.0
+        w = np.where(keep, (1.0 - u * u) ** 2, 0.0)
+        kept = int(np.count_nonzero(keep))
+        if kept < 4:
             return coarse, kept
-        n = float(k2.size)
-        sk = float(k2.sum())
-        sp = float(p2.sum())
-        skk = float((k2 * k2).sum())
-        skp = float((k2 * p2).sum())
+        n = float(w.sum())
+        sk = float((w * k).sum())
+        sp = float((w * p).sum())
+        skk = float((w * k * k).sum())
+        skp = float((w * k * p).sum())
         denom = n * skk - sk * sk
         if abs(denom) < 1e-9:
             return coarse, kept
@@ -537,7 +543,13 @@ def analyze_samples(samples: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE)
 
 
 def load_audio(path: Path, sample_rate: int) -> np.ndarray:
-    """Load ``path`` as mono float32 at ``sample_rate`` using librosa."""
+    """Load ``path`` as mono float32 at ``sample_rate`` using librosa.
+
+    note: the Rust CLI decodes with ffmpeg instead, so the two implementations
+    do not always see identical PCM for a source that needs resampling (librosa
+    uses soxr, ffmpeg its own resampler) or a multichannel source. The DSP is
+    the same; see docs/04-testing.md for how far apart the results land.
+    """
     y, _ = librosa.load(str(path), sr=sample_rate, mono=True, dtype=np.float32)
     if y.size < FFT_SIZE:
         raise ValueError(f"no decodable audio in {path}")

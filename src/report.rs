@@ -204,7 +204,8 @@ mod tests {
     #[test]
     fn the_rule_matches_the_column_widths() {
         let rows = vec![Row::Ok(mk("a.wav", 120.0))];
-        let lines: Vec<&str> = render_table(&rows).lines().collect();
+        let rendered = render_table(&rows);
+        let lines: Vec<&str> = rendered.lines().collect();
         // Header, rule, one row.
         assert_eq!(lines.len(), 3);
         let (header, rule, row) = (lines[0], lines[1], lines[2]);
@@ -221,12 +222,13 @@ mod tests {
             Row::Ok(mk("short.wav", 90.0)),
             Row::Ok(mk("a_much_longer_name.wav", 120.25)),
         ];
-        let lines: Vec<&str> = render_table(&rows).lines().collect();
-        let bpm_col = lines[0].find("BPM").expect("header has BPM");
-        // Every BPM value ends in the same column as the header's.
+        let rendered = render_table(&rows);
+        let lines: Vec<&str> = rendered.lines().collect();
+        // BPM is the last column and right-aligned, so every value *ends* in
+        // the same column as the header's.
+        let bpm_end = lines[0].find("BPM").expect("header has BPM") + "BPM".len();
         for line in &lines[2..] {
-            let value = line.split_whitespace().last().unwrap();
-            assert_eq!(line.len() - value.len(), bpm_col, "line: {line}");
+            assert_eq!(line.len(), bpm_end, "line: {line}");
         }
     }
 }

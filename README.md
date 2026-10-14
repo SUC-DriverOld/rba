@@ -66,7 +66,7 @@ The algorithm is **not** autocorrelation-based, does not use a log spectrum, and
 
 ## Python reference implementation
 
-[`rba.py`](rba.py) is a single-file Python implementation of the same algorithm, with the same CLI. It loads audio with **librosa** and uses **numpy / scipy** for the DSP, so it is a genuinely independent second implementation: different language, different FFT library, different summation strategy, different decoder.
+[`rba.py`](rba.py) is a single-file Python implementation of the same algorithm, with the same CLI. It loads audio with **librosa** and uses **numpy / scipy** for the DSP, so it is a genuinely independent second implementation: different language, different decoder, different FFT library, different summation strategy.
 
 ```bash
 pip install librosa numpy scipy
