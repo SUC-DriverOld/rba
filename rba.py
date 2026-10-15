@@ -752,7 +752,7 @@ def analyze_samples(
 
     spec = spec_thumbnail(samples)
     peak = peak_hold(spec, sample_rate)
-    onsets = build_impact_points(peak, total, 8, sample_rate)
+    onsets = build_impact_points(peak, total, 4, sample_rate)
     base = detect_base_bpm(onsets, total, sample_rate)
 
     smooth = smoothed(spec)

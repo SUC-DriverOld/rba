@@ -66,7 +66,7 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Ana
     thumbnail::peak_hold(&mut peak);
 
     // ── ④ onsets for the tempo histogram (divisor 8) ────────────────────
-    let ip: ImpactPoints = impact::build_impact_points(&peak, total_samples, 8);
+    let ip: ImpactPoints = impact::build_impact_points(&peak, total_samples, 4);
 
     // ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ────────────────
     let base_bpm = detect::detect_base_bpm(&ip);
