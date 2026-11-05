@@ -40,7 +40,41 @@ Options:
 | `RBA_FFMPEG` | `rba_ffmpeg` | `ffmpeg` | ffmpeg executable for that backend |
 | `RBA_SAMPLE_RATE` | `rba_sample_rate` | `44100` | analysis sample rate — leave alone unless experimenting |
 
+Analysis rates must be 8000–192000 Hz; `0` keeps the default 44100 Hz. Native
+source rates must be 1000–768000 Hz. Rates outside these bounds are rejected
+before decoder or resampler allocation.
+
 ### Audio decoding
+
+Native decoding reads the complete stream. Bitrate-based duration estimates in
+unindexed MPEG/ADTS streams are not used as gapless trimming boundaries; explicit
+encoder delay and padding are still respected. Decode errors, stream changes,
+checksum failures and discrepancies against reliable frame counts are reported
+as failures rather than successful partial analyses. Raw streams without a
+declared length cannot prove that an otherwise valid prefix was truncated.
+Exact frame-count comparisons cover WAVE/AIFF/FLAC and MPEG with explicit
+gapless metadata. MP4/AAC and Ogg timing includes codec priming or granule origins,
+so these formats rely on decoder-reported errors rather than exact frame counts.
+This intentionally rejects damaged recordings and unfinished WAV headers that
+were previously accepted as partial audio; repair or re-encode those files first.
+
+The opt-in FFmpeg backend also stops on decode errors and checks reliable frame
+counts when the container provides them. Resampling drains the filter tail and
+removes its initial delay while preserving the rounded output sample count.
+
+### Tests
+
+```sh
+cargo test --locked --all-targets
+```
+
+The committed synthetic MP3 fixtures cover unindexed VBR decoding, gapless
+trimming and damaged inputs without requiring an encoder at test time. FFmpeg
+backend tests run when FFmpeg is available; set `RBA_REQUIRE_FFMPEG=1` to require
+them. CI runs both backends on Windows, macOS and Linux. See
+`tests/fixtures/README.md` for fixture provenance and regeneration.
+
+### Supported formats
 
 Decoding uses the built-in [Symphonia](https://github.com/pdeljanov/Symphonia) engine (wav/aiff/flac/alac/mp3/aac/vorbis/ogg/mp4/mkv, resampled to 44100 Hz with `rubato`) — no external dependencies. Set `RBA_USE_FFMPEG=1` to switch to an external `ffmpeg` (path via `RBA_FFMPEG`), which additionally covers formats Symphonia has no codec for (wma, ape, wv, dsf, …). Both backends fold multichannel to mono with a plain channel sum, matching the original analyzer's PCM reader.
 

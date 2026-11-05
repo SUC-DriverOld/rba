@@ -19,7 +19,6 @@
 # Cargo lock is committed for a binary crate; keep it.
 
 __pycache__/
-tests/
 docs/
 protos/
 re/

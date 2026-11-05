@@ -14,6 +14,25 @@ use std::path::{Path, PathBuf};
 /// Analysis sample rate. The original binary hard-codes the ExtAudioFile
 /// client format to 44100 Hz mono, so this is the faithful default.
 pub const DEFAULT_SAMPLE_RATE: u32 = 44_100;
+pub const MIN_SAMPLE_RATE: u32 = 8_000;
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
+
+pub(crate) fn validate_sample_rate(rate: u32) -> std::result::Result<(), String> {
+    if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) {
+        return Err(format!("analysis sample rate {rate} Hz must be between {MIN_SAMPLE_RATE} and {MAX_SAMPLE_RATE} Hz"));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_sample_rate(value: &str) -> std::result::Result<u32, String> {
+    let rate = value
+        .parse::<u32>()
+        .map_err(|_| "sample rate must be an unsigned integer".to_string())?;
+    if rate != 0 {
+        validate_sample_rate(rate)?;
+    }
+    Ok(rate)
+}
 
 /// FFT / thumbnail frame size (spec §2).
 pub const FFT_SIZE: usize = 256;

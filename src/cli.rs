@@ -76,6 +76,7 @@ pub struct Cli {
         long,
         value_name = "HZ",
         env = "RBA_SAMPLE_RATE",
+        value_parser = crate::config::parse_sample_rate,
         default_value_t = DEFAULT_SAMPLE_RATE
     )]
     pub sample_rate: u32,
@@ -281,6 +282,21 @@ mod tests {
         assert!(c.verbose);
         assert!(c.recursive);
         assert_eq!(c.path, PathBuf::from("Cargo.toml"));
+    }
+
+    #[test]
+    fn sample_rate_parser_accepts_the_default_alias_and_supported_edges() {
+        for rate in ["0", "8000", "44100", "192000"] {
+            let c = parse(&["--sample-rate", rate, "Cargo.toml"]).unwrap();
+            assert_eq!(
+                c.config().sample_rate,
+                if rate == "0" {
+                    DEFAULT_SAMPLE_RATE
+                } else {
+                    rate.parse().unwrap()
+                }
+            );
+        }
     }
 
     #[test]
