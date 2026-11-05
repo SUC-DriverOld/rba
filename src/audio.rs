@@ -16,12 +16,13 @@
 //! ## Downmixing is done here, not by ffmpeg
 //!
 //! ffmpeg's `-ac 1` is *power preserving*: for stereo it produces
-//! `(L+R)/sqrt(2)` rather than `(L+R)/2`, i.e. a `sqrt(2)` gain. That matters
-//! because onset detection compares against an **absolute** threshold, so the
-//! gain change shifts which onsets are found and can move the reported tempo by
-//! several BPM — a 48 kHz stereo MP3 reported 156.60 instead of 160.02. We
-//! therefore decode the source's own channel count and average it ourselves,
-//! which is plain `(L+R)/2`, matching CoreAudio's converter.
+//! `(L+R)/sqrt(2)` rather than a plain sum. That matters because the onset
+//! ladder's thresholds are a discrete ÷1.2 sequence, so any gain change
+//! moves the crossing to a different rung and can change which onsets are
+//! found. We decode the source's own channel count and fold it with a plain
+//! channel **sum** (`L+R`), which is what the original analyzer's PCM reader
+//! does — validated against the Windows oracle on 海边城.mp3 (sum → 160.03
+//! vs mean → 160.18, oracle 160.04).
 
 use std::path::Path;
 use std::process::Command;
@@ -35,7 +36,7 @@ use crate::error::{Error, Result};
 /// cannot deadlock against a full stderr pipe.
 pub fn decode(path: &Path, cfg: &Config) -> Result<Vec<f32>> {
     // Ask for the source's own channel count so ffmpeg applies no mixdown of
-    // its own; we average below. Falling back to stereo keeps mono and stereo
+    // its own; we fold below. Falling back to stereo keeps mono and stereo
     // sources exactly right even when ffprobe is unavailable.
     let channels = probe_channels(path, cfg).unwrap_or(2);
 
@@ -80,13 +81,13 @@ pub fn decode(path: &Path, cfg: &Config) -> Result<Vec<f32>> {
         .collect();
 
     let mut samples: Vec<f32> = if channels > 1 {
-        // Plain average over the frame, matching CoreAudio. A trailing partial
-        // frame is dropped.
+        // Plain channel sum (L+R), matching the original's PCM reader. A
+        // trailing partial frame is dropped.
         let frames = interleaved.len() / channels;
         (0..frames)
             .map(|frame| {
                 let voice = &interleaved[frame * channels..(frame + 1) * channels];
-                voice.iter().sum::<f32>() / channels as f32
+                voice.iter().sum::<f32>()
             })
             .collect()
     } else {

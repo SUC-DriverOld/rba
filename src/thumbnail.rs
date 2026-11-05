@@ -1,11 +1,12 @@
 //! Spectral thumbnail construction and derived envelopes.
 //!
 //! Ports `CPfPcmThumbnail`, `CPcmThumbnailBuilder::BuildSpecEng`,
+//! `BuildPcmThumbnailRange` (the note-detector thumbnail),
 //! `PeakHoldThumbnail` and `SmoothThumbnail`.
 //! Spec: docs/02-algorithm-spec.md §2, §3.
 
 use crate::config::FFT_SIZE;
-use crate::fft::RealFft;
+use crate::fft::SpecEngFft;
 
 /// Samples per measure for a given tempo.
 ///
@@ -102,34 +103,145 @@ impl Thumbnail {
 /// Build the spectral thumbnail: one element per `FFT_SIZE` PCM samples.
 ///
 /// `element[f] = Σ_{k=1}^{N/2-1} |FFT_N(x[f·N .. f·N+N-1] · hamming)|`
+///
+/// The transform is the original's own scaled real FFT (see [`SpecEngFft`]),
+/// and the bins are accumulated left-to-right in `f32` exactly like
+/// `GetSpecEnergy` (which starts at bin 1, skipping DC).
 pub fn spec_thumbnail(samples: &[f32], sample_rate: u32) -> Thumbnail {
     let n = FFT_SIZE;
     let count = samples.len() / n;
     let mut data = Vec::with_capacity(count);
 
-    let mut fft = RealFft::new(n);
-    let mut window = vec![0f32; n];
-    for (i, w) in window.iter_mut().enumerate() {
-        // 0.54 - 0.46*cos(2*pi*i/N); note the original's cos(-0.46) + 0.54 form.
-        let ang = 2.0 * std::f32::consts::PI * (i as f32) / (n as f32);
-        *w = ang.cos() * (-0.46) + 0.54;
-    }
-
-    let mut mag = vec![0f32; n / 2 + 1];
-    let mut frame = vec![0f32; n];
+    let mut fft = SpecEngFft::new(n);
+    let mut mag = vec![0f32; n / 2];
 
     for f in 0..count {
         let src = &samples[f * n..f * n + n];
-        for i in 0..n {
-            frame[i] = src[i] * window[i];
-        }
-        fft.magnitudes(&frame, &mut mag);
+        fft.magnitudes(src, &mut mag);
         // Bins 1..=N/2-1 — DC and Nyquist are excluded (spec §2.3).
         let mut acc = 0f32;
         for m in &mag[1..n / 2] {
             acc += *m;
         }
         data.push(acc);
+    }
+
+    Thumbnail {
+        data,
+        total_samples: samples.len() as i64,
+        sample_rate,
+        samples_per_element: n as u16,
+    }
+}
+
+/// One biquad section of the note detector's high-pass (`CIIRFilt::setfilt` +
+/// `spbiln`, re/16): a 120 Hz Q=1.1 Butterworth-style section.
+///
+/// Digital form (`fl` at re/16): `w[n] = x[n] - k0·w[n-1] - k1·w[n-2]`,
+/// `y[n] = b0·w[n] + b1·w[n-1] + b2·w[n-2]`, all `f32`.
+#[derive(Clone, Copy)]
+struct HpBiquad {
+    b: [f32; 3],
+    k: [f32; 2],
+}
+
+impl HpBiquad {
+    fn design(freq: f32, q: f32, sample_rate: u32) -> Self {
+        // setfilt: t = tan(freq·π·(1/sr)) in double — note the original's
+        // multiplication order (freq·π)·(1/sr), kept for bit-parity.
+        let t = ((freq as f64) * std::f64::consts::PI * (1.0 / sample_rate as f64)).tan();
+        let t2 = (t * t) as f32;
+        let num = [t2, 0.0f32, 0.0f32];
+        let den = [t2, (q as f64 * t) as f32, 1.0f32];
+
+        // spbiln: substitute s ← (1-z)/(1+z). M[m][j] is the coefficient of
+        // z^-j in (1-z)^m (1+z)^(2-m). Products round to f32 before the
+        // accumulators, exactly like the original's f32 prototype arrays.
+        let matrix = [[1.0, 2.0, 1.0], [1.0, 0.0, -1.0], [1.0, -2.0, 1.0]];
+        let mut b = [0f32; 3];
+        let mut dd = [0f64; 3];
+        for j in 0..3 {
+            let mut acc = 0f32;
+            for m in 0..3 {
+                acc += (matrix[m][j] * num[m] as f64) as f32;
+                dd[j] += ((matrix[m][j] * den[m] as f64) as f32) as f64;
+            }
+            b[j] = acc;
+        }
+        let g = dd[0] as f32; // denominator z^0 coefficient
+        for x in b.iter_mut() {
+            *x /= g;
+        }
+        let k = [
+            (dd[1] / g as f64) as f32,
+            (dd[2] / g as f64) as f32,
+        ];
+        HpBiquad { b, k }
+    }
+}
+
+/// State for one running biquad section.
+#[derive(Clone, Copy)]
+struct BiquadState {
+    /// Direct form II transposed state, matching the reference
+    /// implementation's `lfilter` arithmetic bit for bit.
+    s1: f32,
+    s2: f32,
+}
+
+impl BiquadState {
+    const fn new() -> Self {
+        BiquadState { s1: 0.0, s2: 0.0 }
+    }
+
+    #[inline]
+    fn run(&mut self, sec: &HpBiquad, x: f32) -> f32 {
+        let y = sec.b[0] * x + self.s1;
+        let s1 = sec.b[1] * x - sec.k[0] * y + self.s2;
+        let s2 = sec.b[2] * x - sec.k[1] * y;
+        self.s1 = s1;
+        self.s2 = s2;
+        y
+    }
+}
+
+/// `BuildPcmThumbnailRange` (re/16) — the note-detector thumbnail (v35).
+///
+/// The PCM runs through the same 120 Hz Q=1.1 high-pass biquad **three times**
+/// (the DLL cascades six 2nd-order sections; they are identical pairs of this
+/// section), and each element keeps the peak `|x|` of its 256 samples.
+/// Only the `FoldUpBpm` decision consumes this thumbnail, through the
+/// smoothed envelope and the classic detector.
+pub fn note_peak_thumbnail(samples: &[f32], sample_rate: u32) -> Thumbnail {
+    let n = FFT_SIZE;
+    let count = samples.len() / n;
+    let mut data = Vec::with_capacity(count);
+    if count == 0 {
+        return Thumbnail {
+            data,
+            total_samples: samples.len() as i64,
+            sample_rate,
+            samples_per_element: n as u16,
+        };
+    }
+
+    let section = HpBiquad::design(120.0, 1.1, sample_rate);
+    let mut s0 = BiquadState::new();
+    let mut s1 = BiquadState::new();
+    let mut s2 = BiquadState::new();
+
+    for f in 0..count {
+        let mut peak = 0f32;
+        for &x in &samples[f * n..f * n + n] {
+            let y = s0.run(&section, x);
+            let y = s1.run(&section, y);
+            let y = s2.run(&section, y);
+            let a = y.abs();
+            if a > peak {
+                peak = a;
+            }
+        }
+        data.push(peak);
     }
 
     Thumbnail {

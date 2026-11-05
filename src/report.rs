@@ -30,10 +30,7 @@ pub fn print_single(a: &Analysis) {
 
 /// Human-readable breakdown, written to stderr.
 pub fn details(a: &Analysis) -> String {
-    let refinement = match a.trace.refined_bpm {
-        Some(v) => format!("{v:.4} (fit {} onsets)", a.trace.refine_onsets),
-        None => "skipped".to_string(),
-    };
+    let c = &a.trace.chain;
     format!(
         "  file            : {}\n\
          \x20 samples         : {} ({:.2} s @ {} Hz)\n\
@@ -41,11 +38,17 @@ pub fn details(a: &Analysis) -> String {
          \x20 peak-hold decay : {}\n\
          \x20 onsets (slope)  : {}\n\
          \x20 onsets (classic): {}\n\
+         \x20 onsets (chain)  : {}\n\
          \x20 base BPM (0.1)  : {:.2}\n\
          \x20 after fold-up   : {:.2}\n\
-         \x20 refined         : {}\n\
          \x20 short-clip rule : {}\n\
-         \x20 key             : {}\n",
+         \x20 chain unit0     : {:.2}\n\
+         \x20 chain interval  : {:.4}\n\
+         \x20 chain conns     : {}/{} (coverage {:.2})\n\
+         \x20 beat chain      : {:.4} samples/eighth\n\
+         \x20                 : {} chains kept, best {} pts\n\
+         \x20 final BPM       : {:.2}\n\
+         \x20 key (findkey)   : {}\n",
         a.name,
         a.sample_count,
         a.duration,
@@ -54,10 +57,19 @@ pub fn details(a: &Analysis) -> String {
         a.trace.peak_hold_decay_div,
         a.trace.onset_count,
         a.trace.classic_onset_count,
+        a.trace.chain_onset_count,
         a.trace.base_bpm,
         a.trace.folded_bpm,
-        refinement,
         if a.trace.short_clip_applied { "applied" } else { "n/a" },
+        c.unit0,
+        c.interval_est,
+        c.processed,
+        c.candidates,
+        c.coverage,
+        c.io_i,
+        c.chains_kept,
+        c.best_members,
+        a.bpm,
         a.trace.key_detected,
     )
 }

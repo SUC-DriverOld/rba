@@ -23,6 +23,7 @@
 
 pub mod analyze;
 pub mod audio;
+pub mod beatchain;
 pub mod cli;
 pub mod config;
 pub mod detect;

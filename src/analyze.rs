@@ -1,10 +1,14 @@
 //! End-to-end BPM analysis pipeline.
 //!
-//! Mirrors `CProfileBuilder::BuildProfile` (docs/02-algorithm-spec.md §0).
+//! Mirrors `CProfileBuilder::BuildProfile` (docs/02-algorithm-spec.md §0):
+//! spectral thumbnail → peak-hold → onsets(÷4) → base BPM → half-tempo fold
+//! (from the smoothed *note-detector* thumbnail) → short-clip prior →
+//! `BuildBeatPointsAlt` chain stage, which produces the final BPM.
 
 use std::path::Path;
 
 use crate::audio;
+use crate::beatchain::{self, ChainTrace};
 use crate::config::{Config, FFT_SIZE};
 use crate::detect;
 use crate::error::{Error, Result};
@@ -19,8 +23,8 @@ pub struct Analysis {
     pub name: String,
     /// Detected tempo in BPM.
     ///
-    /// `f64` rather than the original's `float` because the refinement stage
-    /// (spec §11) works below the 0.1 grid the recovered algorithm searches on.
+    /// `f64` for display convenience; the chain stage computes in `f32` like
+    /// the original.
     pub bpm: f64,
     /// PCM samples after decode/resample.
     pub sample_count: i64,
@@ -45,11 +49,11 @@ pub struct Trace {
     pub classic_onset_count: usize,
     /// `base_bpm` after the half-tempo fix (spec §6).
     pub folded_bpm: f32,
-    /// Period refinement result (spec §11); `None` when it did not run.
-    pub refined_bpm: Option<f64>,
-    /// How many onsets the refinement fit.
-    pub refine_onsets: usize,
+    /// Onsets feeding the chain stage (divisor 8).
+    pub chain_onset_count: usize,
     pub short_clip_applied: bool,
+    /// Beat-chain stage diagnostics (spec §8).
+    pub chain: ChainTrace,
     /// Key reported by the libKeyFinder port, for `--verbose` (spec §13).
     pub key_detected: String,
 }
@@ -58,40 +62,35 @@ pub struct Trace {
 pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Analysis {
     let total_samples = samples.len() as i64;
 
-    // ── ② spectral thumbnail ────────────────────────────────────────────
+    // ── ② spectral thumbnail (v30) ──────────────────────────────────────
     let spec = thumbnail::spec_thumbnail(samples, sample_rate);
 
-    // ── ③ peak-hold envelope ────────────────────────────────────────────
+    // ── ③ peak-hold envelope (v33) ──────────────────────────────────────
     let mut peak = spec.clone();
     thumbnail::peak_hold(&mut peak);
 
-    // ── ④ onsets for the tempo histogram (divisor 8) ────────────────────
+    // ── ④ onsets for the tempo histogram (divisor 4) ────────────────────
     let ip: ImpactPoints = impact::build_impact_points(&peak, total_samples, 4);
 
     // ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ────────────────
     let base_bpm = detect::detect_base_bpm(&ip);
 
-    // ── ⑥ half-tempo correction (needs the smoothed thumbnail) ─────────
-    let smooth = thumbnail::smoothed(&spec);
-    let ipc = impact::build_impact_points_classic(&smooth, total_samples, 4);
+    // ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─────
+    // The DLL smooths a copy of the *note-detector* thumbnail (filtered
+    // waveform peaks), not the spectral one.
+    let note = thumbnail::note_peak_thumbnail(samples, sample_rate);
+    let ipc = impact::build_impact_points_classic(&thumbnail::smoothed(&note), total_samples, 4);
     let folded_bpm = detect::fold_up_bpm(&ipc, base_bpm);
 
-    // ── ⑦ short-clip override, else ⑧ period refinement ────────────────
-    //
-    // A clip under 30 s is deliberately governed by its *duration* (spec §7),
-    // so refining it against onsets would fight an intentional rule; only
-    // content-derived results get refined.
+    // ── ⑦ short-clip override — a prior, not a verdict: the chain still
+    // runs below and can confirm (or, with content, refine) it ──────────
+    let prior = detect::short_clip_bpm_update(total_samples, sample_rate, folded_bpm);
     let is_short = sample_rate != 0 && 30 * sample_rate as i64 > total_samples;
-    let (bpm, refined_bpm, refine_onsets) = if is_short {
-        (
-            detect::short_clip_bpm_update(total_samples, sample_rate, folded_bpm) as f64,
-            None,
-            0,
-        )
-    } else {
-        let (refined, kept) = detect::refine_bpm(&ip, folded_bpm, sample_rate);
-        (refined, Some(refined), kept)
-    };
+
+    // ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────────
+    let onsets8 = impact::build_impact_points(&peak, total_samples, 8);
+    let mut chain = ChainTrace::default();
+    let bpm = beatchain::beat_chain_bpm(&spec, &onsets8, prior, sample_rate, &mut chain);
 
     // ── ⑩ key: the libKeyFinder chain (spec §13) ───────────────────────
     let key = find_key.then(|| keyfinder::detect_key(samples, sample_rate));
@@ -105,7 +104,7 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Ana
 
     Analysis {
         name: String::new(),
-        bpm,
+        bpm: bpm as f64,
         sample_count: total_samples,
         sample_rate,
         duration,
@@ -117,9 +116,9 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Ana
             base_bpm,
             classic_onset_count: ipc.len(),
             folded_bpm,
-            refined_bpm,
-            refine_onsets,
+            chain_onset_count: onsets8.len(),
             short_clip_applied: is_short,
+            chain,
             key_detected,
         },
     }

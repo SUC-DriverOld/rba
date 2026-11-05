@@ -1,43 +1,78 @@
-//! FFT layer, backed by [`rustfft`].
+//! Bit-exact port of the original's spectral engine FFT.
 //!
-//! The engine only ever needs a 256-point forward transform of a real signal
-//! (docs/02-algorithm-spec.md §2), so this module exposes a deliberately small
-//! one-sided magnitude API rather than raw complex buffers.
+//! `CPfSpecEngBuilder` (`InitializeFFT` + `RealFFT` + `DoFFTToMagnitude`,
+//! re/02 and re/03) is *not* a textbook real FFT: the twiddle table is stored
+//! in bit-reversed order, the decimation-in-frequency pass reads one twiddle
+//! per 2i-complex block, every butterfly output is halved (the spectrum comes
+//! out scaled by 1/128), and the magnitudes are read back through the
+//! bit-reversal table. A generic FFT library produces the same spectrum up to
+//! that 1/128 factor, but the analyzer's onset ladder thresholds are a
+//! discrete ÷1.2 sequence, so even a uniform scale difference can move which
+//! rung the crossing lands on and change the detected onset set. This module
+//! therefore reproduces the original's arithmetic step for step, in `f32`.
 //!
-//! # Why a wrapper instead of calling rustfft directly
-//!
-//! * `rustfft` operates on `Complex<f32>` buffers; the analysis wants a
-//!   windowed real frame in and a one-sided magnitude spectrum out. The
-//!   adapter keeps that conversion (and the planner reuse) in one place.
-//! * The plan is expensive to build and cheap to reuse, so it is created once
-//!   per thumbnail and kept alongside a reusable scratch buffer.
-//! * It gives the rest of the crate a single seam to swap in a different
-//!   backend (e.g. `realfft`) without touching the DSP stages.
+//! The scaling does not affect the rest of the pipeline in any other way:
+//! peak-hold, both impact detectors and the chain confidences are linear or
+//! normalised, so only the ladder rung is scale-sensitive.
 
-use std::sync::Arc;
-
-use rustfft::num_complex::Complex;
-use rustfft::{Fft, FftPlanner};
-
-/// A planned forward FFT for real-valued input of a fixed size.
-pub struct RealFft {
+/// The original's spectral-engine transform, built once per analysis.
+pub struct SpecEngFft {
     n: usize,
-    plan: Arc<dyn Fft<f32>>,
-    buffer: Vec<Complex<f32>>,
+    /// Float-slot index for natural index k (always even).
+    bitrev: Vec<usize>,
+    /// Twiddle pairs, stored bit-reversed: `(sin(-2πj/N), -cos(2πj/N))` at
+    /// float slots `(bitrev[j], bitrev[j]+1)`.
+    tw: Vec<f32>,
+    /// `f32(cos(2πi/N)·-0.46 + 0.54)`, computed in `f64` like the original.
+    window: Vec<f32>,
+    /// Scratch: the windowed frame being transformed.
+    work: Vec<f32>,
 }
 
-impl RealFft {
-    /// Plan a forward transform of size `n`.
+impl SpecEngFft {
+    /// Build the tables for a forward transform of size `n`.
     ///
     /// Panics if `n` is not a power of two (the analysis only ever uses 256).
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two(), "FFT size must be a power of two, got {n}");
-        let mut planner = FftPlanner::<f32>::new();
-        let plan = planner.plan_fft_forward(n);
-        RealFft {
+        let half = n / 2;
+
+        // bitrev[k]: each pass shifts the accumulator right and ORs in
+        // `half` when the corresponding bit of k is set — the standard
+        // bit-reversal of log2(half) bits, doubled.
+        let mut bitrev = vec![0usize; half];
+        for (k, br) in bitrev.iter_mut().enumerate() {
+            let mut v7 = half / 2;
+            let mut v6 = 0usize;
+            while v7 > 0 {
+                let v4 = v6 >> 1;
+                let v5 = if k & v7 != 0 { half } else { 0 };
+                v6 = v5 + v4;
+                v7 >>= 1;
+            }
+            *br = v6;
+        }
+
+        let mut tw = vec![0f32; 2 * half];
+        for j in 0..half {
+            let ang = -2.0 * std::f64::consts::PI * j as f64 / n as f64;
+            tw[bitrev[j]] = ang.sin() as f32;
+            tw[bitrev[j] + 1] = -((2.0 * std::f64::consts::PI * j as f64 / n as f64).cos() as f32);
+        }
+
+        let window = (0..n)
+            .map(|i| {
+                let ang = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+                (ang.cos() * -0.46 + 0.54) as f32
+            })
+            .collect();
+
+        SpecEngFft {
             n,
-            plan,
-            buffer: vec![Complex::new(0.0, 0.0); n],
+            bitrev,
+            tw,
+            window,
+            work: vec![0f32; n],
         }
     }
 
@@ -49,26 +84,94 @@ impl RealFft {
         self.n == 0
     }
 
-    /// One-sided magnitude spectrum of `input` into `out` (`out.len() == n/2 + 1`).
+    /// `DoFFTToMagnitude`: `n/2` bin magnitudes of one real `n`-sample frame.
     ///
-    /// `out[k] = sqrt(re[k]² + im[k]²)` for `k` in `0..=n/2`.
-    ///
-    /// The magnitude is computed manually rather than via `Complex::norm()`
-    /// because `norm()` uses `hypot`, which is more accurate but slower — and
-    /// this is the hot path (one call per 256-sample frame).
+    /// `out[k] = sqrt(re² + im²)` of bin k, with the whole spectrum scaled by
+    /// the original's `1/(n/2)` butterfly halving. `out.len() == n/2`.
     pub fn magnitudes(&mut self, input: &[f32], out: &mut [f32]) {
         let n = self.n;
+        let half = n / 2;
         debug_assert!(input.len() >= n);
-        debug_assert!(out.len() > n / 2);
+        debug_assert_eq!(out.len(), half);
 
-        for (slot, &x) in self.buffer.iter_mut().zip(input.iter()) {
-            *slot = Complex::new(x, 0.0);
+        let work = &mut self.work;
+        for j in 0..n {
+            work[j] = input[j] * self.window[j];
         }
-        self.plan.process(&mut self.buffer);
 
-        for (k, o) in out.iter_mut().enumerate().take(n / 2 + 1) {
-            let c = self.buffer[k];
-            *o = (c.re * c.re + c.im * c.im).sqrt();
+        // ── staged DIF pass (RealFFT): stages i = n/4 … 1, blocks of 2i
+        //    complex, one twiddle per block read sequentially from tw[0] ──
+        let mut i = n >> 2;
+        while i > 0 {
+            let nblocks = half / (2 * i);
+            for b in 0..nblocks {
+                let base = b * 2 * i;
+                let c = self.tw[2 * b];
+                let s = self.tw[2 * b + 1];
+                for k in 0..i {
+                    let lo = base + k;
+                    let hi = base + i + k;
+                    let x1r = work[2 * lo];
+                    let x1i = work[2 * lo + 1];
+                    let x2r = work[2 * hi];
+                    let x2i = work[2 * hi + 1];
+                    let t1 = s * x2r + c * x2i;
+                    let t2 = x2r * c - x2i * s;
+                    let hi2r = (t1 + x1r) * 0.5f32;
+                    work[2 * lo] = hi2r - t1;
+                    work[2 * hi] = hi2r;
+                    let hi2i = (x1i - t2) * 0.5f32;
+                    work[2 * lo + 1] = t2 + hi2i;
+                    work[2 * hi + 1] = hi2i;
+                }
+            }
+            i >>= 1;
+        }
+
+        // ── untangle pass into the real half-spectrum: k = 1 … half/2
+        //    (inclusive) pairs complex[bitrev[k]/2] with
+        //    complex[bitrev[half-k]/2]; the last k pairs a bin with itself
+        //    and its second store wins ────────────────────────────────────
+        let bitrev = &self.bitrev;
+        let tw = &self.tw;
+        for k in 1..=half / 2 {
+            let v = bitrev[k];
+            let w = bitrev[half - k];
+            let ts = tw[v];
+            let tc = tw[v + 1];
+            let vr = work[v];
+            let vi = work[v + 1];
+            let wr = work[w];
+            let wi = work[w + 1];
+            let d_im = vi - wi;
+            let d_re = vr - wr;
+            let sum_wi = (wi + wi) + d_im; // vi + wi
+            let a = ts * d_re - tc * sum_wi;
+            let b_ = tc * d_re + ts * sum_wi;
+            let sum_wr = (wr + wr) + d_re; // vr + wr
+            let v_new_r = (sum_wr + a) * 0.5f32;
+            let v_new_i = (b_ + d_im) * 0.5f32;
+            if v != w {
+                work[v] = v_new_r;
+                work[w] = v_new_r - a;
+                work[v + 1] = v_new_i;
+                work[w + 1] = v_new_i - d_im;
+            } else {
+                work[v] = v_new_r - a;
+                work[v + 1] = v_new_i - d_im;
+            }
+        }
+
+        // DC fold: data[0].re += data[0].im ; data[0].im = 0
+        work[0] += work[1];
+        work[1] = 0.0;
+
+        // magnitudes read back at bit-reversed order (DoFFTToMagnitude)
+        for k in 0..half {
+            let f = bitrev[k];
+            let re = work[f];
+            let im = work[f + 1];
+            out[k] = (re * re + im * im).sqrt();
         }
     }
 }
@@ -77,9 +180,33 @@ impl RealFft {
 mod tests {
     use super::*;
 
-    fn naive_dft_mag(x: &[f32]) -> Vec<f32> {
+    /// Naive DFT magnitude in f64 of the *windowed* frame (the engine
+    /// multiplies by its Hamming window before transforming).
+    fn naive_dft_mag(fft: &SpecEngFft, x: &[f32]) -> Vec<f64> {
         let n = x.len();
-        (0..=n / 2)
+        let wx: Vec<f64> = x
+            .iter()
+            .zip(fft.window.iter())
+            .map(|(&v, &w)| v as f64 * w as f64)
+            .collect();
+        (0..n / 2)
+            .map(|k| {
+                let mut re = 0f64;
+                let mut im = 0f64;
+                for (i, &v) in wx.iter().enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (k * i) as f64 / n as f64;
+                    re += v * a.cos();
+                    im += v * a.sin();
+                }
+                (re * re + im * im).sqrt()
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    fn _unused(x: &[f32]) -> Vec<f64> {
+        let n = x.len();
+        (0..n / 2)
             .map(|k| {
                 let mut re = 0f64;
                 let mut im = 0f64;
@@ -88,15 +215,15 @@ mod tests {
                     re += v as f64 * a.cos();
                     im += v as f64 * a.sin();
                 }
-                (re * re + im * im).sqrt() as f32
+                (re * re + im * im).sqrt()
             })
             .collect()
     }
 
     #[test]
-    fn matches_naive_dft() {
+    fn matches_naive_dft_up_to_the_originals_scaling() {
         let n = 256;
-        let mut fft = RealFft::new(n);
+        let mut fft = SpecEngFft::new(n);
         let input: Vec<f32> = (0..n)
             .map(|i| {
                 let t = i as f32 / n as f32;
@@ -104,40 +231,40 @@ mod tests {
                     + 0.4 * (2.0 * std::f32::consts::PI * 23.0 * t).cos()
             })
             .collect();
-        let mut out = vec![0f32; n / 2 + 1];
+        let mut out = vec![0f32; n / 2];
         fft.magnitudes(&input, &mut out);
-        let want = naive_dft_mag(&input);
+        let want = naive_dft_mag(&fft, &input);
         for (k, (a, b)) in out.iter().zip(want.iter()).enumerate() {
+            // out = want/128 up to f32 rounding
+            let scaled = *a as f64 * 128.0;
             let tol = 1e-3 * (1.0 + b.abs());
-            assert!((a - b).abs() < tol, "bin {k}: got {a}, want {b}");
+            assert!(
+                (scaled - b).abs() < tol,
+                "bin {k}: got {scaled}, want {b}"
+            );
         }
     }
 
     #[test]
-    fn dc_bin_is_the_sum_of_samples() {
-        let n = 64;
-        let mut fft = RealFft::new(n);
-        let input = vec![1.0f32; n];
-        let mut out = vec![0f32; n / 2 + 1];
-        fft.magnitudes(&input, &mut out);
-        assert!((out[0] - n as f32).abs() < 1e-2, "dc = {}", out[0]);
-        // A constant signal has no energy in any other bin.
-        for (k, v) in out.iter().enumerate().skip(1) {
-            assert!(*v < 1e-2, "bin {k} = {v}");
-        }
-    }
-
-    #[test]
-    fn plan_is_reusable_across_frames() {
+    fn dc_bin_is_the_scaled_sample_sum() {
         let n = 256;
-        let mut fft = RealFft::new(n);
-        let mut out = vec![0f32; n / 2 + 1];
+        let mut fft = SpecEngFft::new(n);
+        let mut out = vec![0f32; n / 2];
+        fft.magnitudes(&vec![0.5f32; n], &mut out);
+        let want = naive_dft_mag(&fft, &vec![0.5f32; n])[0] / 128.0;
+        assert!((out[0] as f64 - want).abs() < 1e-5, "dc = {}", out[0]);
+    }
+
+    #[test]
+    fn work_buffer_is_reused_safely() {
+        let n = 256;
+        let mut fft = SpecEngFft::new(n);
+        let mut out = vec![0f32; n / 2];
         let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.1).sin()).collect();
         let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.2).cos()).collect();
-        let mut first = vec![0f32; n / 2 + 1];
+        let mut first = vec![0f32; n / 2];
         fft.magnitudes(&a, &mut out);
         first.copy_from_slice(&out);
-        // Interleave a different frame, then repeat the first: must be identical.
         fft.magnitudes(&b, &mut out);
         fft.magnitudes(&a, &mut out);
         assert_eq!(first, out);

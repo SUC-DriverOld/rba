@@ -3,6 +3,9 @@
 //!
 //! Ports `CPfBpmDetector::DetectBpmWindow`, `DetectBaseBpm`, `FoldUpBpm` and
 //! `CProfileBuilder::ShortClipBpmUpdate`.
+//!
+//! These produce the *coarse* tempo the beat chain (`src/beatchain.rs`) then
+//! refines into the final BPM.
 //! Spec: docs/02-algorithm-spec.md §5, §6, §7.
 
 use crate::impact::ImpactPoints;
@@ -209,89 +212,6 @@ pub fn short_clip_bpm_update(sample_count: i64, sample_rate: u32, bpm: f32) -> f
     } else {
         82.0
     }
-}
-
-/// Refine a coarse tempo to sub-0.1 precision from the onset positions.
-///
-/// # Why this exists
-///
-/// The recovered algorithm scans BPM on a fixed 0.1 grid (§5), so every value it
-/// can produce ends in a zero — `159.90`, `119.80`, … That grid is an artefact of
-/// how the original binary searched, not a property of the music. This stage
-/// leaves the search (and therefore every decision the original made) untouched
-/// and only re-derives the *period* from the onsets that actually landed on the
-/// coarse beat grid.
-///
-/// # Method
-///
-/// Anchor on the coarse beat period `T0 = 60·sr / bpm`. Give each onset a beat
-/// index `k = round(p / T0)` and keep those whose residual to that grid is under
-/// a quarter beat — that rejects syncopated off-beats and half-beats. Then fit
-/// `p ≈ φ + k·T` by least squares, and iterate: once the first pass tightens the
-/// period, beats that had drifted outside the gate come back in.
-///
-/// Returns `(bpm, kept_onsets)`, falling back to the coarse value when the fit is
-/// unsupported or moves more than 5 %.
-///
-/// **This is an enhancement, not part of the reverse-engineered algorithm.**
-/// See docs/02-algorithm-spec.md §11.
-pub fn refine_bpm(onsets: &ImpactPoints, bpm: f32, sample_rate: u32) -> (f64, usize) {
-    let coarse = bpm as f64;
-    // Negated form on purpose: it also rejects NaN, like every other guard in
-    // this module (the original's comparisons behave the same way).
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(coarse > 0.0) || sample_rate == 0 || onsets.len() < 8 {
-        return (coarse, 0);
-    }
-
-    let mut period = sample_rate as f64 * 60.0 / coarse;
-    let mut kept = 0usize;
-
-    for _ in 0..4 {
-        if !period.is_finite() || period <= 0.0 {
-            return (coarse, kept);
-        }
-        let tol = period / 4.0;
-
-        // Weighted least squares of (k, p) with intercept. The weight tapers to
-        // zero at the gate rather than cutting off, so an onset landing exactly
-        // on the boundary cannot flip the fit. A hard gate is discontinuous
-        // there, and the two implementations' onset positions can differ by a
-        // sample (rustfft's f32 spectra vs scipy's), which used to move the
-        // result by ~0.01 BPM.
-        let (mut n, mut sk, mut sp, mut skk, mut skp) = (0f64, 0f64, 0f64, 0f64, 0f64);
-        let mut count = 0usize;
-        for &p in &onsets.points {
-            let pf = p as f64;
-            let k = (pf / period).round();
-            let u = (pf - k * period).abs() / tol;
-            if u >= 1.0 {
-                continue;
-            }
-            count += 1;
-            let w = (1.0 - u * u).powi(2);
-            n += w;
-            sk += w * k;
-            sp += w * pf;
-            skk += w * k * k;
-            skp += w * k * pf;
-        }
-        kept = count;
-        if n < 4.0 {
-            return (coarse, kept);
-        }
-        let denom = n * skk - sk * sk;
-        if denom.abs() < 1e-9 {
-            return (coarse, kept);
-        }
-        period = (n * skp - sk * sp) / denom;
-    }
-
-    let refined = sample_rate as f64 * 60.0 / period;
-    if !refined.is_finite() || (refined - coarse).abs() / coarse > 0.05 {
-        return (coarse, kept);
-    }
-    (refined, kept)
 }
 
 #[cfg(test)]
