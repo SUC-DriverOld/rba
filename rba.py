@@ -22,8 +22,9 @@ from pathlib import Path
 
 import librosa
 import numpy as np
-from tqdm import tqdm
 from scipy.fft import irfft, rfft
+from scipy.signal import lfilter
+from tqdm import tqdm
 
 __version__ = "0.1.0"
 
@@ -140,24 +141,164 @@ def sam_per_meas(bpm: float, sample_rate: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class _SpecEngFft:
+    """Bit-exact port of `CPfSpecEngBuilder` (re/02, re/03).
+
+    ``InitializeFFT`` builds a bit-reversal table and a bit-reversal-*stored*
+    twiddle table (``sin(-2πj/N)``, ``-cos(2πj/N)`` as f32 pairs); the data is
+    the 256 real samples re-packed as 128 complex, transformed by a
+    decimation-in-frequency pass (one twiddle per 2i-complex block, stages
+    i = N/4 … 1) and untangled into the 128-bin real spectrum.  Every
+    arithmetic step runs in float32 exactly as the DLL does — numpy only
+    vectorises the same operations across frames/elements, which does not
+    change any individual result.
+    """
+
+    def __init__(self, n: int):
+        self.n = n
+        half = n // 2
+
+        # bitrev[k]: float-slot index for natural index k (always even)
+        bitrev = np.zeros(half, dtype=np.int64)
+        for k in range(half):
+            v7 = half // 2
+            v6 = 0
+            while v7 > 0:
+                v4 = v6 >> 1
+                v5 = half if (k & v7) else 0
+                v6 = v5 + v4
+                v7 >>= 1
+            bitrev[k] = v6
+        self.bitrev = bitrev
+
+        # twiddle pairs stored at float slots (bitrev[k], bitrev[k]+1)
+        tw = np.zeros(2 * half, dtype=np.float32)
+        j = np.arange(half, dtype=np.float64)
+        tw_sin = np.sin(-2.0 * np.pi * j / n).astype(np.float32)
+        tw_cos = (-np.cos(2.0 * np.pi * j / n)).astype(np.float32)
+        tw[bitrev] = tw_sin
+        tw[bitrev + 1] = tw_cos
+        self.tw = tw
+
+        # w[i] = f32(cos(2πi/N)·-0.46 + 0.54), computed in double like the DLL
+        idx = np.arange(n, dtype=np.float64)
+        self.window = (np.cos(2.0 * np.pi * idx / n) * -0.46 + 0.54).astype(np.float32)
+
+        self._half = half
+
+    def magnitudes(self, frames: np.ndarray) -> np.ndarray:
+        """(count, n//2) bin magnitudes for (count, n) real frames."""
+        n = self.n
+        half = self._half
+        count = frames.shape[0]
+        work = (frames * self.window).astype(np.float32)
+        data = work.reshape(count, half, 2)
+        twc = self.tw.reshape(half, 2)
+        half_f = np.float32(0.5)
+
+        # ── staged DIF pass (RealFFT) — stages i = N/4 … 1 ───────────────
+        i = n >> 2
+        while i > 0:
+            nblocks = half // (2 * i)
+            # one scalar twiddle per 2i-complex block, walked from tw[0]
+            for b in range(nblocks):
+                base = b * 2 * i
+                c = twc[b, 0]
+                s = twc[b, 1]
+                lo = data[:, base : base + i]
+                hi = data[:, base + i : base + 2 * i]
+                hr = hi[:, :, 0]
+                hi_im = hi[:, :, 1]
+                t1 = (s * hr + c * hi_im).astype(np.float32)
+                t2 = (hr * c - hi_im * s).astype(np.float32)
+                x1r = lo[:, :, 0]
+                x1i = lo[:, :, 1]
+                hi2r = ((t1 + x1r) * half_f).astype(np.float32)
+                lo[:, :, 0] = (hi2r - t1).astype(np.float32)
+                hi[:, :, 0] = hi2r
+                hi2i = ((x1i - t2) * half_f).astype(np.float32)
+                lo[:, :, 1] = (t2 + hi2i).astype(np.float32)
+                hi[:, :, 1] = hi2i
+            i >>= 1
+
+        # ── untangle pass into the real half-spectrum ────────────────────
+        # k = 1 … half/2 (inclusive) pairs v = complex[bitrev[k]/2] with
+        # w = complex[bitrev[half-k]/2]; the last k pairs a bin with itself.
+        br = self.bitrev
+        kk = np.arange(1, half // 2 + 1)
+        v_idx = (br[kk] // 2).astype(np.int64)
+        w_idx = (br[half - kk] // 2).astype(np.int64)
+        ts = twc[v_idx, 0].reshape(1, -1)
+        tc = twc[v_idx, 1].reshape(1, -1)
+
+        # k = 1 … half/2-1 pair distinct bins; k = half/2 pairs a bin with
+        # itself (both writes land on the same slot, the second wins).
+        pairs = slice(0, half // 2 - 1)
+        vp, wp = v_idx[pairs], w_idx[pairs]
+        vr = data[:, vp, 0]
+        vi = data[:, vp, 1]
+        wr = data[:, wp, 0]
+        wi = data[:, wp, 1]
+        d_im = (vi - wi).astype(np.float32)
+        d_re = (vr - wr).astype(np.float32)
+        sum_wi = ((wi + wi).astype(np.float32) + d_im).astype(np.float32)   # vi+wi
+        A = (ts[:, pairs] * d_re - tc[:, pairs] * sum_wi).astype(np.float32)
+        B = (tc[:, pairs] * d_re + ts[:, pairs] * sum_wi).astype(np.float32)
+        sum_wr = ((wr + wr).astype(np.float32) + d_re).astype(np.float32)   # vr+wr
+        v_new_r = ((sum_wr + A) * half_f).astype(np.float32)
+        v_new_i = ((B + d_im) * half_f).astype(np.float32)
+        data[:, vp, 0] = v_new_r
+        data[:, wp, 0] = (v_new_r - A).astype(np.float32)
+        data[:, vp, 1] = v_new_i
+        data[:, wp, 1] = (v_new_i - d_im).astype(np.float32)
+
+        # self-paired bin k = half/2 (v == w): reads first, then both writes
+        # hit the same slot; the second ([edx]) store wins.
+        sp = int(v_idx[half // 2 - 1])
+        vr = data[:, sp, 0].copy()
+        vi = data[:, sp, 1].copy()
+        s_t, c_t = float(twc[v_idx[half // 2 - 1], 0]), float(twc[v_idx[half // 2 - 1], 1])
+        sum_wi = (vi + vi).astype(np.float32)
+        A = (np.float32(s_t) * np.float32(0.0) - np.float32(c_t) * sum_wi).astype(np.float32)
+        B = (np.float32(c_t) * np.float32(0.0) + np.float32(s_t) * sum_wi).astype(np.float32)
+        sum_wr = (vr + vr).astype(np.float32)
+        data[:, sp, 0] = (((sum_wr + A) * half_f).astype(np.float32) - A).astype(np.float32)
+        data[:, sp, 1] = ((B + np.float32(0.0)) * half_f).astype(np.float32)
+
+        # DC fold: data[0].re += data[0].im ; data[0].im = 0
+        data[:, 0, 0] = (data[:, 0, 0] + data[:, 0, 1]).astype(np.float32)
+        data[:, 0, 1] = 0.0
+
+        # magnitudes read at bit-reversed order (DoFFTToMagnitude)
+        src = data[:, br // 2]
+        re = src[:, :, 0]
+        im = src[:, :, 1]
+        return np.sqrt((re * re + im * im).astype(np.float32))
+
+
+_SPEC_FFT = _SpecEngFft(FFT_SIZE)
+
+
 def spec_thumbnail(samples: np.ndarray) -> np.ndarray:
     """One element per 256-sample frame: sum of |FFT bins 1..127| of a Hamming window.
 
     DC (bin 0) and Nyquist (bin 128) are excluded, exactly as ``GetSpecEnergy``
-    does for N=256.
+    does for N=256.  The whole computation is float32 (see `_SpecEngFft`), and
+    the 127 bins are accumulated strictly left-to-right like the original.
     """
     n = FFT_SIZE
     count = samples.size // n
     if count == 0:
         return np.zeros(0, dtype=np.float32)
 
-    frames = samples[: count * n].reshape(count, n)
-    # w[i] = cos(2*pi*i/N) * -0.46 + 0.54
-    idx = np.arange(n, dtype=np.float64)
-    window = np.cos(2.0 * np.pi * idx / n) * -0.46 + 0.54
+    frames = np.ascontiguousarray(samples[: count * n], dtype=np.float32).reshape(count, n)
+    mag = _SPEC_FFT.magnitudes(frames)
 
-    mag = np.abs(rfft(frames * window, axis=1))
-    return mag[:, 1 : n // 2].sum(axis=1).astype(np.float32)
+    # sequential f32 accumulation over bins 1..127, like GetSpecEnergy
+    acc = mag[:, 1].copy()
+    for k in range(2, n // 2):
+        acc += mag[:, k]
+    return acc
 
 
 def peak_hold(t: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
@@ -329,6 +470,598 @@ def build_impact_points_classic(t, total_samples: int, divisor: int, sample_rate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Note-detector thumbnail (v35) — CIIRFilt high-pass + waveform peak
+#
+# `CPfNoteDetector`'s ctor initialises a second thumbnail with the same
+# 256-sample stride and fills it from the *filtered* waveform: `PushPcm`
+# runs the PCM through a `CIIRFilt` configured as 3 cascaded type-0
+# ("high-pass") biquad sections (freq 120.0, Q 1.1, gain 0) and
+# `BuildPcmThumbnailRange` stores max|x| per 256 filtered samples.
+# `BuildProfile` smooths a copy of this thumbnail and runs
+# `BuildImpactPointsClassic` on it — that onset set is what `FoldUpBpm`
+# sees (docs/02 §6, re/16, re/14).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _iir_hp_biquad(freq: float = 120.0, q: float = 1.1,
+                   sample_rate: int = DEFAULT_SAMPLE_RATE) -> tuple[list[float], list[float]]:
+    """`CIIRFilt::setfilt` + `spbiln` for one type-0 section (re/16).
+
+    Returns ``(b, k)`` with the digital section
+
+        w[n] = x[n] - k0·w[n-1] - k1·w[n-2]
+        y[n] = b0·w[n] + b1·w[n-1] + b2·w[n-2]
+
+    — exactly the recurrence `CIIRFilt::fl` runs (re/16 @ 0x137a8).
+    """
+    # setfilt: t = tan(freq * pi * (1/sr)) in double; prototype coefficients
+    # are stored to f32 arrays.
+    t = math.tan(float(np.float32(freq)) * math.pi * (1.0 / float(sample_rate)))
+    t2 = np.float32(t * t)
+    num = (t2, np.float32(0.0), np.float32(0.0))                       # [t², 0, 0]
+    den = (t2, np.float32(float(np.float32(q)) * t), np.float32(1.0))  # [t², Q·t, 1]
+
+    # spbiln: substitute s ← (1-z)/(1+z).  M[m][j] is the coefficient of z^-j
+    # in (1-z)^m (1+z)^(2-m).
+    matrix = ((1.0, 2.0, 1.0), (1.0, 0.0, -1.0), (1.0, -2.0, 1.0))
+    b = [np.float32(0.0)] * 3
+    dd = [0.0] * 3                       # denominator accumulator (double)
+    for j in range(3):
+        acc = np.float32(0.0)
+        for m in range(3):
+            acc = np.float32(acc + np.float32(matrix[m][j] * num[m]))
+            dd[j] += float(np.float32(matrix[m][j] * den[m]))
+        b[j] = acc
+    g = np.float32(dd[0])                # denominator z^0 coefficient
+    b = [np.float32(x / g) for x in b]
+    k = [np.float32(dd[1] / g), np.float32(dd[2] / g)]
+    return [float(x) for x in b], [float(x) for x in k]
+
+
+_HP_B, _HP_K = _iir_hp_biquad()
+
+
+def note_peak_thumbnail(samples: np.ndarray,
+                        sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
+    """v35 — max|x| per 256 samples of the 6th-order 120 Hz high-passed waveform.
+
+    The three sections are identical, so the cascade is the same biquad
+    applied three times with persistent state (`fl` runs per 256-sample
+    `PushPcm` block; filtering the whole stream section-by-section is
+    equivalent). scipy's `lfilter` keeps float32 precision.
+    """
+    x = np.ascontiguousarray(samples, dtype=np.float32)
+    if sample_rate != DEFAULT_SAMPLE_RATE:
+        b, k = _iir_hp_biquad(sample_rate=sample_rate)
+    else:
+        b, k = _HP_B, _HP_K
+    a = np.array([1.0, k[0], k[1]], dtype=np.float32)
+    bb = np.array(b, dtype=np.float32)
+    y = x
+    for _ in range(3):
+        y = lfilter(bb, a, y)
+    count = y.size // FFT_SIZE
+    if count == 0:
+        return np.zeros(0, dtype=np.float32)
+    peaks = np.abs(y[: count * FFT_SIZE].reshape(count, FFT_SIZE)).max(axis=1)
+    return peaks.astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Beat chain (spec §8, re/17) — CPfBeatBuilder::ClusterFilterPoints and
+# BuildBeatPointsAlt: the DLL's final BPM stage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Phase 6: connections only span ≤ 32 interval units (≈ 4 measures).
+CHAIN_MAX_UNITS = 32
+#: Phase 10: chains whose first/last index difference is ≤ this are dropped.
+CHAIN_MIN_INDEX_SPAN = 31
+
+
+def _f32(x) -> float:
+    """Round through float32 (the chain stage is all single-precision)."""
+    return float(np.float32(x))
+
+
+def _u32_sat(x: float) -> int:
+    """§3.1-A — the chain stage's saturating ``(u32)double`` conversion."""
+    if x >= 2147483648.0:
+        m, hi = 2147483648.0, 0x80000000
+    else:
+        m, hi = 0.0, 0
+    t = min(max(x, 0.0), 4294967295.0) - m
+    return (int(t) ^ hi) & 0xFFFFFFFF
+
+
+def _calc_point_confidence(thumb: np.ndarray, pos: int) -> float:
+    """`CalcPointConfidence` (re/17 §3.2) — 16-element rise around the onset.
+
+    ``Σ thumb[idx..idx+7] − Σ thumb[idx-8..idx-1]`` with every index clamped to
+    ``[0, count-1]`` and out-of-range reads returning 0.
+    """
+    n1 = int(thumb.size) - 1
+    idx = pos // FFT_SIZE            # __divdi3: signed, truncating
+
+    def clamp(v: int) -> int:
+        if v < 0:
+            return 0
+        return v if v <= n1 else n1
+
+    lo1, lo2 = clamp(idx - 8), clamp(idx - 1)
+    hi1, hi2 = clamp(idx), clamp(idx + 7)
+    acc = np.float32(0.0)
+    if lo2 >= lo1:
+        acc = np.float32(acc - thumb[lo1:lo2 + 1].sum(dtype=np.float32))
+    if hi2 >= hi1:
+        acc = np.float32(acc + thumb[hi1:hi2 + 1].sum(dtype=np.float32))
+    return float(acc)
+
+
+def _proximity_conf_filter(pos: list[int], conf: list[float], interval: float) -> list[int]:
+    """`ProximityConfFilter` (re/17 §3.6) — non-maximum suppression.
+
+    Within ±``trunc(0.45·I)`` samples only the most confident candidate
+    survives; survivors keep their relative order. Returns kept indices.
+    """
+    limit = int(np.float32(np.float32(0.45) * interval))
+    n = len(pos)
+    nxt = list(range(1, n + 1))          # nxt[n] == n doubles as the end sentinel
+    prv = list(range(-1, n))
+    head = 0
+
+    cur = head
+    while cur < n:
+        nxt_cur = nxt[cur]               # advance before a possible erase
+        best = cur
+        i = cur                          # backward scan (includes cur)
+        while i >= 0 and limit > pos[cur] - pos[i]:
+            if conf[i] > conf[best]:
+                best = i
+            i = prv[i]
+        j = cur                          # forward scan (includes cur)
+        while j < n and limit > pos[j] - pos[cur]:
+            if conf[j] > conf[best]:
+                best = j
+            j = nxt[j]
+        if cur != best and conf[best] > conf[cur]:
+            p, s = prv[cur], nxt[cur]
+            if p >= 0:
+                nxt[p] = s
+            else:
+                head = s
+            if s < n:
+                prv[s] = p
+        cur = nxt_cur
+
+    out = []
+    i = head
+    while i < n:
+        out.append(i)
+        i = nxt[i]
+    return out
+
+
+def _connection_candidates(pos: np.ndarray, conf: np.ndarray,
+                           interval: float) -> tuple[np.ndarray, np.ndarray, np.float32]:
+    """Phase 6 — all pairs (i, j), i < j, within 32 units, with `CalcConQuality`
+    scores. Vectorised in float32 like the original."""
+    n = pos.size
+    empty_i = np.zeros(0, dtype=np.int64)
+    if n < 2 or not interval > 0.0:
+        return empty_i, empty_i.copy(), np.zeros(0, dtype=np.float32)
+
+    # Break condition: u32_sat(d/I + 0.5) > 32  ⇔  d ≥ 32.5·I (d ≥ 0).
+    reach = pos + np.float64(np.float32(np.float32(32.5) * interval))
+    hi = np.searchsorted(pos, reach, side="left")
+
+    ii, jj = [], []
+    for i in range(n - 1):
+        j1 = int(hi[i])
+        if j1 > i + 1:
+            ii.append(np.full(j1 - (i + 1), i, dtype=np.int64))
+            jj.append(np.arange(i + 1, j1, dtype=np.int64))
+    if not ii:
+        return empty_i, empty_i.copy(), np.zeros(0, dtype=np.float32)
+    i_arr = np.concatenate(ii)
+    j_arr = np.concatenate(jj)
+
+    d = pos[j_arr] - pos[i_arr]
+    n_units = np.trunc(d.astype(np.float64) / np.float64(interval) + 0.5).astype(np.int64)
+
+    x = d.astype(np.float32) / np.float32(interval)
+    r = np.float32(x + np.float32(0.5)).astype(np.int32)   # cvttss2si of (x+0.5f)
+    frac = x - r.astype(np.float32)
+    v = np.float32(1.0) - np.abs(frac)
+    phase = np.zeros(x.size, dtype=np.float32)
+    gate = v > np.float32(0.8)
+    ramp = gate & (v <= np.float32(0.98))
+    phase[gate] = np.float32(1.0)
+    phase[ramp] = ((v[ramp] - np.float32(0.8)) / np.float32(0.18)).astype(np.float32)
+
+    tol = np.ones(x.size, dtype=np.float32)
+    long_span = n_units > 8
+    tol[long_span] = ((32 - n_units[long_span]).astype(np.float32)
+                      / np.float32(24.0)).astype(np.float32)
+
+    quality = ((phase * tol).astype(np.float32) * conf[i_arr]).astype(np.float32)
+    quality = (quality * conf[j_arr]).astype(np.float32)
+
+    keep = (n_units >= 1) & (quality > np.float32(0.0))
+    return i_arr[keep], j_arr[keep], quality[keep]
+
+
+@dataclass
+class ChainTrace:
+    """Diagnostics from the chain stage (for --verbose)."""
+    unit0: float = 0.0                  # SamPerMeas(bpm)>>3, as f32
+    interval_est: float = 0.0           # spacing re-estimate before clustering
+    candidates: int = 0                 # connections with quality > 0
+    processed: int = 0                  # connections consumed before coverage break
+    coverage: float = 0.0               # coverage when the assembly stopped
+    chains_total: int = 0               # chains in the map when assembly stopped
+    chains_kept: int = 0                # chains surviving phases 9-10
+    best_members: int = 0               # members of the winning chain
+    io_i: float = 0.0                   # final interval (samples per eighth)
+    #: per scored chain: (weight, member count, span, mean_conf, own ioI)
+    chain_details: list = field(default_factory=list)
+
+
+def _cluster_filter_points(thumb: np.ndarray, i0: float, points: list[int],
+                           trace: ChainTrace) -> tuple[float, list[int]]:
+    """`CPfBeatBuilder::ClusterFilterPoints` (re/17 §2) — faithful port.
+
+    Returns ``(ioI, emitted positions)``; the emitted positions are the union
+    of surviving chains' onsets (the DLL feeds them to `InterpolatePoints` /
+    `ExtrapolatePoints`, which do not influence the BPM).
+    """
+    # ── phase 1: points + confidence ────────────────────────────────────
+    pos: list[int] = []
+    conf: list[float] = []
+    min_c = max_c = 0.0
+    for k, p in enumerate(points):
+        c = _calc_point_confidence(thumb, p)
+        pos.append(p)
+        conf.append(c)
+        if k == 0:
+            min_c = max_c = c
+        else:
+            min_c = _f32(min(min_c, c))
+            max_c = _f32(max(max_c, c))
+
+    # ── phase 2: normalise confidences to [0, 1] ────────────────────────
+    rng = _f32(max_c - min_c)
+    scale = rng if rng != 0.0 else 1.0
+    conf = [_f32(_f32(c - min_c) / scale) for c in conf]
+
+    # ── phase 3: proximity thinning (uses the *input* interval) ─────────
+    kept = _proximity_conf_filter(pos, conf, i0)
+
+    # ── phase 4: re-index ───────────────────────────────────────────────
+    pos = [pos[i] for i in kept]
+    conf = [conf[i] for i in kept]
+    n = len(pos)
+    index = list(range(n))              # index == array position
+
+    # ── phase 5: re-estimate the interval from 1-3-unit spacings ────────
+    interval = _reestimate_interval(pos, i0)
+
+    # ── phase 6: candidate connections, sorted by quality (desc) ────────
+    pos_arr = np.asarray(pos, dtype=np.int64)
+    conf_arr = np.asarray(conf, dtype=np.float32)
+    ci, cj, cq = _connection_candidates(pos_arr, conf_arr, interval)
+    order = np.argsort(-cq, kind="stable")
+    ci, cj = ci[order], cj[order]
+    trace.candidates = int(ci.size)
+
+    # ── phase 7: greedy chain assembly ──────────────────────────────────
+    chain_id = [-1] * n
+    active = [True] * n
+    nxt: list[list[int]] = [[] for _ in range(n)]
+    prv: list[list[int]] = [[] for _ in range(n)]
+    chains: dict[int, list[int]] = {}   # id → sorted member indices
+    next_id = 1
+    active_count = n
+    assigned_count = 0
+
+    def deactivate_reach(start: int, links: list[list[int]]) -> None:
+        """`DeactivateAllNext/Prev` — clears `active` on every descendant.
+
+        The DLL recurses through *already inactive* nodes as well (no
+        active-flag check), so traversal must not stop at inactive points;
+        clearing is idempotent, and the next-graph is a DAG (links always
+        point towards strictly greater indices), so this terminates.
+        """
+        nonlocal active_count, assigned_count
+        stack = list(links[start])
+        while stack:
+            p = stack.pop()
+            if active[p]:
+                active[p] = False
+                active_count -= 1
+                if chain_id[p] != -1:
+                    assigned_count -= 1
+            stack.extend(links[p])
+
+    def earliest(a: int) -> int:
+        """`GetEarliestLink` — min index over a and its prev-descendants."""
+        best = index[a]
+        stack = list(prv[a])
+        while stack:
+            p = stack.pop()
+            if index[p] < best:
+                best = index[p]
+            stack.extend(prv[p])
+        return best
+
+    def latest(a: int) -> int:
+        """`GetLatestLink` — max index over a and its next-descendants."""
+        best = index[a]
+        stack = list(nxt[a])
+        while stack:
+            p = stack.pop()
+            if index[p] > best:
+                best = index[p]
+            stack.extend(nxt[p])
+        return best
+
+    def disconnect(this: int, other: int) -> None:
+        """`CPfBeatPoint::Disconnect` — erase other from both link lists."""
+        if other in nxt[this]:
+            nxt[this].remove(other)
+        if other in prv[this]:
+            prv[this].remove(other)
+
+    def disconnect_all_next(a: int) -> None:
+        for p in list(nxt[a]):
+            disconnect(p, a)
+        nxt[a].clear()
+
+    def disconnect_all_prev(a: int) -> None:
+        for p in list(prv[a]):
+            disconnect(p, a)
+        prv[a].clear()
+
+    def rebuild_chain(cid: int) -> None:
+        ch = chains.get(cid)
+        if ch is None:
+            return
+        ch.clear()
+        for p in range(n):
+            if chain_id[p] == cid and active[p]:
+                ch.append(index[p])
+        ch.sort()
+
+    processed = 0
+    for a, b in zip(ci.tolist(), cj.tolist()):
+        processed += 1
+        if not (active[a] and active[b]):
+            continue                     # skips the coverage check, like the DLL
+        ca, cb = chain_id[a], chain_id[b]
+        connect = False
+        if ca == -1:
+            if cb == -1:
+                # both unassigned → new chain
+                chain_id[a] = next_id
+                chain_id[b] = next_id
+                chains[next_id] = sorted([index[a], index[b]])
+                next_id += 1
+                assigned_count += 2
+                connect = True
+            elif index[a] < earliest(b):
+                # A prepends itself to B's chain
+                deactivate_reach(b, prv)
+                disconnect_all_prev(b)
+                chain_id[a] = cb
+                assigned_count += 1
+                rebuild_chain(cb)
+                connect = True
+        elif cb == -1:
+            if latest(a) < index[b]:
+                # B appends itself to A's chain
+                deactivate_reach(a, nxt)
+                disconnect_all_next(a)
+                chain_id[b] = ca
+                assigned_count += 1
+                rebuild_chain(ca)
+                connect = True
+        elif ca != cb:
+            ea, la = earliest(a), latest(a)
+            eb, lb = earliest(b), latest(b)
+            if ea <= eb and la >= lb:
+                # B's span inside A's — B's chain is dropped entirely.
+                deactivate_reach(b, prv)
+                disconnect_all_prev(b)
+                deactivate_reach(b, nxt)
+                disconnect_all_next(b)
+                if active[b]:
+                    active[b] = False
+                    active_count -= 1
+                    if chain_id[b] != -1:
+                        assigned_count -= 1
+                chains.pop(cb, None)
+            elif ea >= eb and la <= lb:
+                deactivate_reach(a, prv)
+                disconnect_all_prev(a)
+                deactivate_reach(a, nxt)
+                disconnect_all_next(a)
+                if active[a]:
+                    active[a] = False
+                    active_count -= 1
+                    if chain_id[a] != -1:
+                        assigned_count -= 1
+                chains.pop(ca, None)
+            elif ea < eb:
+                # merge B's chain into A's
+                deactivate_reach(a, nxt)
+                disconnect_all_next(a)
+                deactivate_reach(b, prv)
+                disconnect_all_prev(b)
+                keep_id = chain_id[a]
+                for p in range(n):
+                    if chain_id[p] == cb:
+                        chain_id[p] = keep_id
+                chains.pop(cb, None)
+                rebuild_chain(keep_id)
+                connect = True
+
+        if connect:
+            # Connect(A, B); Connect(B, A) — A is always the earlier point.
+            nxt[a].append(b)             # index[b] > index[a]
+            prv[b].append(a)
+
+        if active_count != 0:
+            coverage = assigned_count / active_count
+            if coverage >= 0.8:
+                break
+
+    trace.processed = processed
+    trace.coverage = (assigned_count / active_count) if active_count else 0.0
+    trace.chains_total = len(chains)
+
+    # ── phase 8: chain scoring ──────────────────────────────────────────
+    spans: list[int] = []
+    items_list: list[list[int]] = []
+    means: list[float] = []
+    max_span = -1
+    min_mc = max_mc = 0.0
+    for cid in sorted(chains):
+        items = chains[cid]
+        span = pos[items[-1]] - pos[items[0]]
+        s = np.float32(0.0)
+        for ix in items:
+            s = np.float32(s + np.float32(conf[ix]))
+        mean_c = _f32(s / np.float32(len(items))) if items else 0.0
+        spans.append(span)
+        items_list.append(items)
+        means.append(mean_c)
+        if max_span == -1:
+            max_span, min_mc, max_mc = span, mean_c, mean_c
+        else:
+            max_span = max(max_span, span)
+            max_mc = _f32(max(max_mc, mean_c))
+            min_mc = _f32(min(min_mc, mean_c))
+    if max_span == 0:
+        max_span = 1
+    span_f = _f32(max_span)
+    conf_range = _f32(max_mc - min_mc)
+    if conf_range == 0.0:
+        conf_range = 1.0
+
+    scored = []
+    for span, mc, items in zip(spans, means, items_list):
+        weight = _f32(_f32(_f32(span) / span_f) * _f32(_f32(mc - min_mc) / conf_range))
+        # diagnostics: this chain's own ioI (what it would report if it won)
+        sd = sn = 0
+        prev = None
+        for ix in items:
+            cur = pos[ix]
+            if prev is not None:
+                d = cur - prev
+                sd += d
+                sn += _u32_sat(float(d) / float(interval) + 0.5)
+            prev = cur
+        own = _f32(float(sd) / float(sn)) if sn else interval
+        scored.append((weight, items))
+        trace.chain_details.append((weight, len(items), span, mc, own))
+    scored.sort(key=lambda t: t[0], reverse=True)   # stable, like std::list::sort
+
+    # ── phase 9: overlap suppression ────────────────────────────────────
+    kept_chains: list[list[int]] = []
+    for _, items in scored:
+        dropped = False
+        for kitems in kept_chains:
+            if not (kitems[-1] < items[0] or items[-1] < kitems[0]):
+                dropped = True
+                break
+        if not dropped:
+            kept_chains.append(items)
+
+    # ── phase 10: reject short chains (first/last index span ≤ 31) ──────
+    kept_chains = [items for items in kept_chains
+                   if items[-1] - items[0] > CHAIN_MIN_INDEX_SPAN]
+
+    trace.chains_kept = len(kept_chains)
+
+    # ── phase 11: emit + final interval from the best chain ─────────────
+    emitted: list[int] = []
+    for items in kept_chains:
+        emitted.extend(pos[ix] for ix in items)
+
+    io_i = interval
+    if kept_chains:
+        items = kept_chains[0]
+        sum_d = 0
+        sum_n = 0
+        prev = None
+        for ix in items:
+            cur = pos[ix]
+            if prev is not None:
+                d = cur - prev
+                sum_d += d
+                sum_n += _u32_sat(float(d) / float(interval) + 0.5)
+            prev = cur
+        trace.best_members = len(items)
+        if sum_n != 0:
+            io_i = _f32(float(sum_d) / float(sum_n))
+    trace.io_i = io_i
+    return io_i, emitted
+
+
+def _reestimate_interval(points: list[int], unit0: float) -> float:
+    """The BuildBeatPointsAlt / phase-5 spacing fit (re/17 §4.2).
+
+    Consecutive spacings that are 1-3 units of ``unit0`` within ±5 % vote;
+    the mean of ``d/n`` wins, else ``unit0``.
+    """
+    lo = int(_f32(_f32(unit0 * np.float32(-0.05)) + unit0))
+    hi = int(_f32(_f32(unit0 * np.float32(0.05)) + unit0))
+    total = 0
+    cnt = 0
+    prev = None
+    for cur in points:
+        if prev is not None:
+            d = cur - prev
+            m = _u32_sat(float(d) / float(unit0) + 0.5)
+            if 1 <= m <= 3:
+                q = d // m
+                if lo <= q <= hi:
+                    total += q
+                    cnt += 1
+        prev = cur
+    if cnt != 0:
+        return _f32(_f32(total) / _f32(cnt))
+    return unit0
+
+
+def beat_chain_bpm(spec_thumb: np.ndarray, onsets8: list[int],
+                   bpm_prior: float, sample_rate: int,
+                   trace: ChainTrace | None = None) -> float:
+    """`CPfBeatBuilder::BuildBeatPointsAlt` (re/17 §4.2).
+
+    ``onsets8`` is ``BuildImpactPoints(peakThumb, 8)`` — the DLL re-detects
+    onsets with divisor 8 for the chain stage. The refined interval comes
+    back from `ClusterFilterPoints` and the BPM is
+    ``60 / (8·ioI·0.25 / sr) = 30·sr / ioI``.
+    """
+    if trace is None:
+        trace = ChainTrace()
+    unit0 = sam_per_meas(bpm_prior, sample_rate) >> 3
+    v9 = _f32(unit0)
+    trace.unit0 = v9
+
+    interval = _reestimate_interval(onsets8, v9)
+    trace.interval_est = interval
+
+    io_i, _emitted = _cluster_filter_points(spec_thumb, interval, onsets8, trace)
+
+    if sample_rate != 0:
+        p = _f32(_f32(_f32(8.0 * io_i) * 0.25) / _f32(sample_rate))
+        if p != 0.0:
+            return _f32(60.0 / p)
+    return _f32(bpm_prior)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tempo estimation (spec §5, §6, §7)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -467,72 +1200,6 @@ def short_clip_bpm_update(sample_count: int, sample_rate: int, bpm: float) -> fl
         # The original's float literal 164.00999 rounds to the same float32 as 164.01.
         return np.float32(164.01) if b > upper else np.float32(b)
     return np.float32(82.0)
-
-
-def refine_bpm(onsets, bpm: float, sample_rate: int) -> tuple[float, int]:
-    """Refine a coarse tempo past the 0.1 grid, from the onset positions.
-
-    Why this exists
-    ---------------
-    The recovered algorithm scans BPM on a fixed 0.1 grid (spec §5), so every
-    value it can produce ends in a zero -- ``159.90``, ``119.80``, ... That grid
-    is an artefact of how the original binary searched, not a property of the
-    music. This stage leaves the search (and therefore every decision the
-    original made) untouched and only re-derives the *period* from the onsets
-    that actually landed on the coarse beat grid.
-
-    Method
-    ------
-    Anchor on the coarse beat period ``T0 = 60*sr/bpm``. Give each onset a beat
-    index ``k = round(p / T0)`` and weight each one by how close it sits to that
-    grid, tapering to zero at a quarter beat -- that rejects syncopated off-beats
-    and half-beats without a hard cut-off. Then fit ``p ~= phase + k*T`` by
-    weighted least squares, and iterate: once the first pass tightens the
-    period, beats that had drifted outside the gate come back in.
-
-    Returns ``(bpm, kept_onsets)``, falling back to the coarse value when the fit
-    is unsupported or moves more than 5 %.
-
-    **This is an enhancement, not part of the reverse-engineered algorithm.**
-    See docs/02-algorithm-spec.md §11.
-    """
-    coarse = float(bpm)
-    if not coarse > 0.0 or sample_rate == 0 or len(onsets) < 8:
-        return coarse, 0
-
-    p = np.asarray(onsets, dtype=np.float64)
-    period = sample_rate * 60.0 / coarse
-    kept = 0
-
-    for _ in range(4):
-        if not np.isfinite(period) or period <= 0.0:
-            return coarse, kept
-        tol = period / 4.0
-        k = np.round(p / period)
-        # Tapered weight rather than a hard gate: an onset sitting exactly on the
-        # boundary would otherwise flip the fit, and the two implementations'
-        # onset positions can differ by a sample (rustfft f32 vs scipy). See
-        # src/detect.rs.
-        u = np.abs(p - k * period) / tol
-        keep = u < 1.0
-        w = np.where(keep, (1.0 - u * u) ** 2, 0.0)
-        kept = int(np.count_nonzero(keep))
-        if kept < 4:
-            return coarse, kept
-        n = float(w.sum())
-        sk = float((w * k).sum())
-        sp = float((w * p).sum())
-        skk = float((w * k * k).sum())
-        skp = float((w * k * p).sum())
-        denom = n * skk - sk * sk
-        if abs(denom) < 1e-9:
-            return coarse, kept
-        period = (n * skp - sk * sp) / denom
-
-    refined = sample_rate * 60.0 / period
-    if not np.isfinite(refined) or abs(refined - coarse) / coarse > 0.05:
-        return coarse, kept
-    return float(refined), kept
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,15 +1380,15 @@ class Trace:
     peak_hold_decay_div: int = 0
     onset_count: int = 0
     classic_onset_count: int = 0
+    #: Onsets from BuildImpactPoints(peakThumb, 8) — the chain's input.
+    chain_onset_count: int = 0
     #: Tempo from the 0.1-grid phase-histogram search (spec §5).
     base_bpm: float = 0.0
     #: ``base_bpm`` after the half-tempo fix (spec §6).
     folded_bpm: float = 0.0
-    #: Period refinement result (spec §11); ``None`` when it did not run.
-    refined_bpm: float | None = None
-    #: How many onsets the refinement fit.
-    refine_onsets: int = 0
     short_clip_applied: bool = False
+    #: Beat-chain stage internals (spec §8).
+    chain: ChainTrace = field(default_factory=ChainTrace)
     #: Key reported by the libKeyFinder port (spec §13).
     key_detected: str = "not requested"
 
@@ -745,32 +1412,42 @@ def analyze_samples(
 ) -> Analysis:
     """Run the recovered pipeline (docs/02-algorithm-spec.md §0).
 
+    Mirrors `CProfileBuilder::BuildProfile` stage for stage: spectral
+    thumbnail → peak-hold → onsets(÷4) → base BPM → half-tempo fold (from
+    the smoothed *note-detector* thumbnail) → short-clip rule →
+    `BuildBeatPointsAlt` chain refinement, which produces the final BPM.
     ``find_key`` additionally runs the libKeyFinder port (spec §13).
     """
     samples = np.ascontiguousarray(samples, dtype=np.float32)
     total = int(samples.size)
 
+    # ── ② spectral thumbnail (v30) ──────────────────────────────────────
     spec = spec_thumbnail(samples)
+    # ── ③ peak-hold envelope (v33) ──────────────────────────────────────
     peak = peak_hold(spec, sample_rate)
+    # ── ④ onsets for the tempo histogram (divisor 4) ────────────────────
     onsets = build_impact_points(peak, total, 4, sample_rate)
+    # ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ─────────────────
     base = detect_base_bpm(onsets, total, sample_rate)
 
-    smooth = smoothed(spec)
-    classic = build_impact_points_classic(smooth, total, 4, sample_rate)
+    # ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─────
+    # The DLL smooths a copy of the *note-detector* thumbnail (filtered
+    # waveform peaks), not the spectral one; see note_peak_thumbnail.
+    note = note_peak_thumbnail(samples, sample_rate)
+    classic = build_impact_points_classic(smoothed(note), total, 4, sample_rate)
     folded = fold_up_bpm(classic, base, sample_rate)
 
-    # A clip under 30 s is deliberately governed by its *duration* (spec §7), so
-    # refining it against onsets would fight an intentional rule; only
-    # content-derived results get refined.
+    # ── ⑦ short-clip override — a prior, not a verdict: the chain still
+    # runs and can confirm (or, with content, refine) it below.
+    prior = float(short_clip_bpm_update(total, sample_rate, folded))
     is_short = sample_rate != 0 and 30 * sample_rate > total
-    if is_short:
-        bpm = float(short_clip_bpm_update(total, sample_rate, folded))
-        refined, kept = None, 0
-    else:
-        bpm, kept = refine_bpm(onsets, folded, sample_rate)
-        refined = bpm
 
-    # ── ⑩ key: the libKeyFinder chain (spec §13) ──────────────────────
+    # ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────────
+    onsets8 = build_impact_points(peak, total, 8, sample_rate)
+    chain = ChainTrace()
+    bpm = beat_chain_bpm(spec, onsets8, prior, sample_rate, chain)
+
+    # ── ⑩ key: the libKeyFinder chain (spec §13) ────────────────────────
     key = detect_key(samples, sample_rate) if find_key else None
 
     return Analysis(
@@ -783,12 +1460,12 @@ def analyze_samples(
             thumbnail_elements=int(spec.size),
             peak_hold_decay_div=int((sam_per_meas(164.0, sample_rate) // FFT_SIZE) >> 4),
             onset_count=len(onsets),
-            base_bpm=float(base),
             classic_onset_count=len(classic),
+            chain_onset_count=len(onsets8),
+            base_bpm=float(base),
             folded_bpm=float(folded),
-            refined_bpm=refined,
-            refine_onsets=kept,
             short_clip_applied=is_short,
+            chain=chain,
             key_detected=key if key is not None else "not requested",
         ),
     )
@@ -797,12 +1474,22 @@ def analyze_samples(
 def load_audio(path: Path, sample_rate: int) -> np.ndarray:
     """Load ``path`` as mono float32 at ``sample_rate`` using librosa.
 
+    Multichannel sources are folded with a plain channel **sum** (L+R), the
+    convention the original analyzer's PCM reader uses — not an average.  The
+    distinction is observable: the impact-point ladder thresholds are a
+    discrete ÷1.2 sequence, so a ÷2 scale shift moves the crossing to a
+    different step and changes the onset set (validated against the Windows
+    oracle on 海边城.mp3: sum → 160.03 vs mean → 160.18, oracle 160.04).
+
     note: the Rust CLI decodes with ffmpeg instead, so the two implementations
     do not always see identical PCM for a source that needs resampling (librosa
-    uses soxr, ffmpeg its own resampler) or a multichannel source. The DSP is
-    the same; see docs/04-testing.md for how far apart the results land.
+    uses soxr, ffmpeg its own resampler). The DSP is the same; see
+    docs/04-testing.md for how far apart the results land.
     """
-    y, _ = librosa.load(str(path), sr=sample_rate, mono=True, dtype=np.float32)
+    y, _ = librosa.load(str(path), sr=sample_rate, mono=False, dtype=np.float32)
+    if y.ndim > 1:
+        y = y.sum(axis=0)
+    y = np.ascontiguousarray(y, dtype=np.float32)
     if y.size < FFT_SIZE:
         raise ValueError(f"no decodable audio in {path}")
     return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
@@ -817,11 +1504,7 @@ def analyze_file(path: Path, sample_rate: int, find_key: bool = False) -> Analys
 
 def detail_lines(a: Analysis) -> str:
     t = a.trace
-    refinement = (
-        f"{t.refined_bpm:.4f} (fit {t.refine_onsets} onsets)"
-        if t.refined_bpm is not None
-        else "skipped"
-    )
+    c = t.chain
     return (
         f"  file            : {a.name}\n"
         f"  samples         : {a.sample_count} ({a.duration:.2f} s @ {a.sample_rate} Hz)\n"
@@ -829,10 +1512,16 @@ def detail_lines(a: Analysis) -> str:
         f"  peak-hold decay : {t.peak_hold_decay_div}\n"
         f"  onsets (slope)  : {t.onset_count}\n"
         f"  onsets (classic): {t.classic_onset_count}\n"
+        f"  onsets (chain)  : {t.chain_onset_count}\n"
         f"  base BPM (0.1)  : {t.base_bpm:.2f}\n"
         f"  after fold-up   : {t.folded_bpm:.2f}\n"
-        f"  refined         : {refinement}\n"
         f"  short-clip rule : {'applied' if t.short_clip_applied else 'n/a'}\n"
+        f"  chain unit0     : {c.unit0:.2f}\n"
+        f"  chain interval  : {c.interval_est:.4f}\n"
+        f"  chain conns     : {c.processed}/{c.candidates} (coverage {c.coverage:.2f})\n"
+        f"  beat chain      : {c.io_i:.4f} samples/eighth\n"
+        f"                  : {c.chains_kept} chains kept, best {c.best_members} pts\n"
+        f"  final BPM       : {a.bpm:.2f}\n"
         f"  key (findkey)   : {t.key_detected}\n"
     )
 
