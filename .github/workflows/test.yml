@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-regressions:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run native regression tests without FFmpeg
+        env:
+          # Keep optional FFmpeg checks disabled even on runners with it preinstalled.
+          RBA_TEST_FFMPEG: ${{ runner.temp }}/rba-no-ffmpeg
+        run: cargo test --locked --all-targets

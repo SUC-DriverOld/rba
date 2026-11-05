@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The external decoder (ffmpeg/ffprobe) failed or could not be executed.
+    /// Audio decoding, integrity checking, or resampling failed.
     #[error("audio decoder: {0}")]
     Decoder(String),
 
