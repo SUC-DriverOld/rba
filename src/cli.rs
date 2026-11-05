@@ -114,7 +114,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
     "mka", "webm", "mpc", "spx", "3gp", "ra",
 ];
 
-fn has_audio_extension(p: &Path) -> bool {
+pub fn has_audio_extension(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
@@ -122,14 +122,14 @@ fn has_audio_extension(p: &Path) -> bool {
 }
 
 /// macOS writes `._name` sidecar files next to media; they are not audio.
-fn is_resource_fork(p: &Path) -> bool {
+pub fn is_resource_fork(p: &Path) -> bool {
     p.file_name()
         .map(|n| n.to_string_lossy().starts_with("._"))
         .unwrap_or(false)
 }
 
 /// Collect audio files under `dir`, sorted, optionally recursing.
-fn collect_audio_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+pub fn collect_audio_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     let depth = if recursive { usize::MAX } else { 1 };
     let mut files: Vec<PathBuf> = WalkDir::new(dir)
         .max_depth(depth)
