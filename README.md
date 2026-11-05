@@ -68,11 +68,16 @@ removes its initial delay while preserving the rounded output sample count.
 cargo test --locked --all-targets
 ```
 
-The committed synthetic MP3 fixtures cover unindexed VBR decoding, gapless
-trimming and damaged inputs without requiring an encoder at test time. FFmpeg
-backend tests run when FFmpeg is available; set `RBA_REQUIRE_FFMPEG=1` to require
-them. CI runs both backends on Windows, macOS and Linux. See
-`tests/fixtures/README.md` for fixture provenance and regeneration.
+The committed synthetic fixtures cover unindexed VBR decoding, gapless trimming
+and damaged inputs without requiring FFmpeg or an encoder at test time. The
+default CI verifies native decoding without FFmpeg on Windows, macOS and Linux.
+
+FFmpeg backend tests run locally when FFmpeg is available; set
+`RBA_REQUIRE_FFMPEG=1` to require them, or `RBA_TEST_FFMPEG` to use a specific
+executable. The separate **FFmpeg compatibility** workflow runs these checks on
+all three platforms only when manually dispatched. FFmpeg is not required for
+normal builds or native decoding. See `tests/fixtures/README.md` for fixture
+provenance and regeneration.
 
 ### Supported formats
 

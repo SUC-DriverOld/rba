@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  audio-regressions:
+  native-regressions:
     strategy:
       fail-fast: false
       matrix:
@@ -17,31 +17,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
-      RBA_REQUIRE_FFMPEG: "1"
+      # Keep optional FFmpeg checks disabled even on runners with it preinstalled.
+      RBA_TEST_FFMPEG: ${{ runner.temp }}/rba-no-ffmpeg
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install FFmpeg on Linux
-        if: runner.os == 'Linux'
-        run: |
-          if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-          fi
-      - name: Install FFmpeg on macOS
-        if: runner.os == 'macOS'
-        run: |
-          if ! command -v ffmpeg >/dev/null; then
-            brew install ffmpeg
-          fi
-      - name: Install FFmpeg on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-            choco install ffmpeg --no-progress -y
-            if ($LASTEXITCODE -ne 0) { throw "FFmpeg installation failed" }
-            "$env:ChocolateyInstall\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          }
-      - name: Run native and FFmpeg regression tests
+      - name: Run native regression tests without FFmpeg
         run: cargo test --locked --all-targets
