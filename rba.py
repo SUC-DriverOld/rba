@@ -483,8 +483,8 @@ def build_impact_points_classic(t, total_samples: int, divisor: int, sample_rate
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _iir_hp_biquad(freq: float = 120.0, q: float = 1.1,
-                   sample_rate: int = DEFAULT_SAMPLE_RATE) -> tuple[list[float], list[float]]:
+def _iir_note_biquad(freq: float = 120.0, q: float = 1.1,
+                     sample_rate: int = DEFAULT_SAMPLE_RATE) -> tuple[list[float], list[float]]:
     """`CIIRFilt::setfilt` + `spbiln` for one type-0 section (re/16).
 
     Returns ``(b, k)`` with the digital section
@@ -492,7 +492,10 @@ def _iir_hp_biquad(freq: float = 120.0, q: float = 1.1,
         w[n] = x[n] - k0·w[n-1] - k1·w[n-2]
         y[n] = b0·w[n] + b1·w[n-1] + b2·w[n-2]
 
-    — exactly the recurrence `CIIRFilt::fl` runs (re/16 @ 0x137a8).
+    — the recurrence `CIIRFilt::fl` runs (re/16 @ 0x137a8).  Despite the
+    prototype's look, the measured response is a **low-pass** that isolates
+    the bass register (docs/02 §12.2: 3 cascaded sections give −40 dB at
+    262 Hz); the numerator works out to `t²(1+z⁻¹)²`, zero at Nyquist.
     """
     # setfilt: t = tan(freq * pi * (1/sr)) in double; prototype coefficients
     # are stored to f32 arrays.
@@ -518,12 +521,12 @@ def _iir_hp_biquad(freq: float = 120.0, q: float = 1.1,
     return [float(x) for x in b], [float(x) for x in k]
 
 
-_HP_B, _HP_K = _iir_hp_biquad()
+_NOTE_B, _NOTE_K = _iir_note_biquad()
 
 
 def note_peak_thumbnail(samples: np.ndarray,
                         sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
-    """v35 — max|x| per 256 samples of the 6th-order 120 Hz high-passed waveform.
+    """v35 — max|x| per 256 samples of the 3-section 120 Hz filtered waveform.
 
     The three sections are identical, so the cascade is the same biquad
     applied three times with persistent state (`fl` runs per 256-sample
@@ -532,9 +535,9 @@ def note_peak_thumbnail(samples: np.ndarray,
     """
     x = np.ascontiguousarray(samples, dtype=np.float32)
     if sample_rate != DEFAULT_SAMPLE_RATE:
-        b, k = _iir_hp_biquad(sample_rate=sample_rate)
+        b, k = _iir_note_biquad(sample_rate=sample_rate)
     else:
-        b, k = _HP_B, _HP_K
+        b, k = _NOTE_B, _NOTE_K
     a = np.array([1.0, k[0], k[1]], dtype=np.float32)
     bb = np.array(b, dtype=np.float32)
     y = x

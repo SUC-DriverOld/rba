@@ -134,18 +134,20 @@ pub fn spec_thumbnail(samples: &[f32], sample_rate: u32) -> Thumbnail {
     }
 }
 
-/// One biquad section of the note detector's high-pass (`CIIRFilt::setfilt` +
-/// `spbiln`, re/16): a 120 Hz Q=1.1 Butterworth-style section.
+/// One biquad section of the note detector's filter (`CIIRFilt::setfilt` +
+/// `spbiln`, re/16): 120 Hz, Q=1.1. Despite the prototype's look the
+/// measured response is a **low-pass** isolating the bass register (the
+/// numerator works out to `t²(1+z⁻¹)²`, zero at Nyquist); see docs/02 §12.2.
 ///
 /// Digital form (`fl` at re/16): `w[n] = x[n] - k0·w[n-1] - k1·w[n-2]`,
 /// `y[n] = b0·w[n] + b1·w[n-1] + b2·w[n-2]`, all `f32`.
 #[derive(Clone, Copy)]
-struct HpBiquad {
+struct NoteBiquad {
     b: [f32; 3],
     k: [f32; 2],
 }
 
-impl HpBiquad {
+impl NoteBiquad {
     fn design(freq: f32, q: f32, sample_rate: u32) -> Self {
         // setfilt: t = tan(freq·π·(1/sr)) in double — note the original's
         // multiplication order (freq·π)·(1/sr), kept for bit-parity.
@@ -176,7 +178,7 @@ impl HpBiquad {
             (dd[1] / g as f64) as f32,
             (dd[2] / g as f64) as f32,
         ];
-        HpBiquad { b, k }
+        NoteBiquad { b, k }
     }
 }
 
@@ -195,7 +197,7 @@ impl BiquadState {
     }
 
     #[inline]
-    fn run(&mut self, sec: &HpBiquad, x: f32) -> f32 {
+    fn run(&mut self, sec: &NoteBiquad, x: f32) -> f32 {
         let y = sec.b[0] * x + self.s1;
         let s1 = sec.b[1] * x - sec.k[0] * y + self.s2;
         let s2 = sec.b[2] * x - sec.k[1] * y;
@@ -207,9 +209,10 @@ impl BiquadState {
 
 /// `BuildPcmThumbnailRange` (re/16) — the note-detector thumbnail (v35).
 ///
-/// The PCM runs through the same 120 Hz Q=1.1 high-pass biquad **three times**
-/// (the DLL cascades six 2nd-order sections; they are identical pairs of this
-/// section), and each element keeps the peak `|x|` of its 256 samples.
+/// The PCM runs through the same 120 Hz Q=1.1 biquad **three times** —
+/// `CPfNoteDetector` builds one `CIIRFilt` with exactly three sections
+/// (`[filt+48] = 3`, freq 120.0, Q 1.1 each) — and each element keeps the
+/// peak `|x|` of its 256 samples.
 /// Only the `FoldUpBpm` decision consumes this thumbnail, through the
 /// smoothed envelope and the classic detector.
 pub fn note_peak_thumbnail(samples: &[f32], sample_rate: u32) -> Thumbnail {
@@ -225,7 +228,7 @@ pub fn note_peak_thumbnail(samples: &[f32], sample_rate: u32) -> Thumbnail {
         };
     }
 
-    let section = HpBiquad::design(120.0, 1.1, sample_rate);
+    let section = NoteBiquad::design(120.0, 1.1, sample_rate);
     let mut s0 = BiquadState::new();
     let mut s1 = BiquadState::new();
     let mut s2 = BiquadState::new();
