@@ -1399,8 +1399,9 @@ class Trace:
 @dataclass
 class Analysis:
     name: str = ""
-    bpm: float = 0.0
-    #: libKeyFinder key name, e.g. ``"G major"``; ``None`` when --nokey was given.
+    #: Detected tempo; ``None`` when --keyonly skipped the BPM pipeline.
+    bpm: float | None = None
+    #: libKeyFinder key name, e.g. ``"G major"``; ``None`` when --bpmonly was given.
     key: str | None = None
     sample_count: int = 0
     sample_rate: int = DEFAULT_SAMPLE_RATE
@@ -1411,55 +1412,56 @@ class Analysis:
 def analyze_samples(
     samples: np.ndarray,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
+    find_bpm: bool = True,
     find_key: bool = False,
 ) -> Analysis:
     """Run the recovered pipeline (docs/02-algorithm-spec.md §0).
 
-    Mirrors `CProfileBuilder::BuildProfile` stage for stage: spectral
-    thumbnail → peak-hold → onsets(÷4) → base BPM → half-tempo fold (from
-    the smoothed *note-detector* thumbnail) → short-clip rule →
-    `BuildBeatPointsAlt` chain refinement, which produces the final BPM.
-    ``find_key`` additionally runs the libKeyFinder port (spec §13).
+    With ``find_bpm`` the tempo path mirrors `CProfileBuilder::BuildProfile`
+    stage for stage: spectral thumbnail → peak-hold → onsets(÷4) → base BPM →
+    half-tempo fold (from the smoothed *note-detector* thumbnail) → short-clip
+    rule → `BuildBeatPointsAlt` chain refinement, which produces the final
+    BPM.  ``find_key`` additionally runs the libKeyFinder port (spec §13).
+    Skipping a pass leaves its field ``None`` and its trace values default.
     """
     samples = np.ascontiguousarray(samples, dtype=np.float32)
     total = int(samples.size)
 
-    # ── ② spectral thumbnail (v30) ──────────────────────────────────────
-    spec = spec_thumbnail(samples)
-    # ── ③ peak-hold envelope (v33) ──────────────────────────────────────
-    peak = peak_hold(spec, sample_rate)
-    # ── ④ onsets for the tempo histogram (divisor 4) ────────────────────
-    onsets = build_impact_points(peak, total, 4, sample_rate)
-    # ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ─────────────────
-    base = detect_base_bpm(onsets, total, sample_rate)
-
-    # ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─────
-    # The DLL smooths a copy of the *note-detector* thumbnail (filtered
-    # waveform peaks), not the spectral one; see note_peak_thumbnail.
-    note = note_peak_thumbnail(samples, sample_rate)
-    classic = build_impact_points_classic(smoothed(note), total, 4, sample_rate)
-    folded = fold_up_bpm(classic, base, sample_rate)
-
-    # ── ⑦ short-clip override — a prior, not a verdict: the chain still
-    # runs and can confirm (or, with content, refine) it below.
-    prior = float(short_clip_bpm_update(total, sample_rate, folded))
-    is_short = sample_rate != 0 and 30 * sample_rate > total
-
-    # ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────────
-    onsets8 = build_impact_points(peak, total, 8, sample_rate)
-    chain = ChainTrace()
-    bpm = beat_chain_bpm(spec, onsets8, prior, sample_rate, chain)
-
     # ── ⑩ key: the libKeyFinder chain (spec §13) ────────────────────────
     key = detect_key(samples, sample_rate) if find_key else None
+    key_detected = key if key is not None else "not requested"
 
-    return Analysis(
-        bpm=float(bpm),
-        key=key,
-        sample_count=total,
-        sample_rate=sample_rate,
-        duration=(total / sample_rate) if sample_rate else 0.0,
-        trace=Trace(
+    trace = Trace(key_detected=key_detected)
+    bpm: float | None = None
+
+    if find_bpm:
+        # ── ② spectral thumbnail (v30) ──────────────────────────────────
+        spec = spec_thumbnail(samples)
+        # ── ③ peak-hold envelope (v33) ──────────────────────────────────
+        peak = peak_hold(spec, sample_rate)
+        # ── ④ onsets for the tempo histogram (divisor 4) ────────────────
+        onsets = build_impact_points(peak, total, 4, sample_rate)
+        # ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ─────────────
+        base = detect_base_bpm(onsets, total, sample_rate)
+
+        # ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─
+        # The DLL smooths a copy of the *note-detector* thumbnail (filtered
+        # waveform peaks), not the spectral one; see note_peak_thumbnail.
+        note = note_peak_thumbnail(samples, sample_rate)
+        classic = build_impact_points_classic(smoothed(note), total, 4, sample_rate)
+        folded = fold_up_bpm(classic, base, sample_rate)
+
+        # ── ⑦ short-clip override — a prior, not a verdict: the chain still
+        # runs and can confirm (or, with content, refine) it below.
+        prior = float(short_clip_bpm_update(total, sample_rate, folded))
+        is_short = sample_rate != 0 and 30 * sample_rate > total
+
+        # ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────
+        onsets8 = build_impact_points(peak, total, 8, sample_rate)
+        chain = ChainTrace()
+        bpm = float(beat_chain_bpm(spec, onsets8, prior, sample_rate, chain))
+
+        trace = Trace(
             thumbnail_elements=int(spec.size),
             peak_hold_decay_div=int((sam_per_meas(164.0, sample_rate) // FFT_SIZE) >> 4),
             onset_count=len(onsets),
@@ -1469,8 +1471,16 @@ def analyze_samples(
             folded_bpm=float(folded),
             short_clip_applied=is_short,
             chain=chain,
-            key_detected=key if key is not None else "not requested",
-        ),
+            key_detected=key_detected,
+        )
+
+    return Analysis(
+        bpm=bpm,
+        key=key,
+        sample_count=total,
+        sample_rate=sample_rate,
+        duration=(total / sample_rate) if sample_rate else 0.0,
+        trace=trace,
     )
 
 
@@ -1498,35 +1508,49 @@ def load_audio(path: Path, sample_rate: int) -> np.ndarray:
     return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def analyze_file(path: Path, sample_rate: int, find_key: bool = False) -> Analysis:
+def analyze_file(
+    path: Path,
+    sample_rate: int,
+    find_bpm: bool = True,
+    find_key: bool = False,
+) -> Analysis:
     samples = load_audio(path, sample_rate)
-    result = analyze_samples(samples, sample_rate, find_key)
+    result = analyze_samples(samples, sample_rate, find_bpm, find_key)
     result.name = path.name
     return result
 
 
 def detail_lines(a: Analysis) -> str:
+    """Verbose breakdown, written to stderr.
+
+    Only the passes that ran are shown: with ``--keyonly`` the tempo lines are
+    absent (their trace values are defaults, not measurements).
+    """
     t = a.trace
     c = t.chain
-    return (
-        f"  file            : {a.name}\n"
-        f"  samples         : {a.sample_count} ({a.duration:.2f} s @ {a.sample_rate} Hz)\n"
-        f"  thumbnail elems : {t.thumbnail_elements}\n"
-        f"  peak-hold decay : {t.peak_hold_decay_div}\n"
-        f"  onsets (slope)  : {t.onset_count}\n"
-        f"  onsets (classic): {t.classic_onset_count}\n"
-        f"  onsets (chain)  : {t.chain_onset_count}\n"
-        f"  base BPM (0.1)  : {t.base_bpm:.2f}\n"
-        f"  after fold-up   : {t.folded_bpm:.2f}\n"
-        f"  short-clip rule : {'applied' if t.short_clip_applied else 'n/a'}\n"
-        f"  chain unit0     : {c.unit0:.2f}\n"
-        f"  chain interval  : {c.interval_est:.4f}\n"
-        f"  chain conns     : {c.processed}/{c.candidates} (coverage {c.coverage:.2f})\n"
-        f"  beat chain      : {c.io_i:.4f} samples/eighth\n"
-        f"                  : {c.chains_kept} chains kept, best {c.best_members} pts\n"
-        f"  final BPM       : {a.bpm:.2f}\n"
-        f"  key (findkey)   : {t.key_detected}\n"
-    )
+    parts = [
+        f"  file            : {a.name}\n",
+        f"  samples         : {a.sample_count} ({a.duration:.2f} s @ {a.sample_rate} Hz)\n",
+    ]
+    if a.bpm is not None:
+        parts += [
+            f"  thumbnail elems : {t.thumbnail_elements}\n",
+            f"  peak-hold decay : {t.peak_hold_decay_div}\n",
+            f"  onsets (slope)  : {t.onset_count}\n",
+            f"  onsets (classic): {t.classic_onset_count}\n",
+            f"  onsets (chain)  : {t.chain_onset_count}\n",
+            f"  base BPM (0.1)  : {t.base_bpm:.2f}\n",
+            f"  after fold-up   : {t.folded_bpm:.2f}\n",
+            f"  short-clip rule : {'applied' if t.short_clip_applied else 'n/a'}\n",
+            f"  chain unit0     : {c.unit0:.2f}\n",
+            f"  chain interval  : {c.interval_est:.4f}\n",
+            f"  chain conns     : {c.processed}/{c.candidates} (coverage {c.coverage:.2f})\n",
+            f"  beat chain      : {c.io_i:.4f} samples/eighth\n",
+            f"                  : {c.chains_kept} chains kept, best {c.best_members} pts\n",
+            f"  final BPM       : {a.bpm:.2f}\n",
+        ]
+    parts.append(f"  key (findkey)   : {t.key_detected}\n")
+    return "".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1568,7 +1592,8 @@ def build_parser() -> argparse.ArgumentParser:
             "OUTPUT:\n"
             "  A single file names the file, its tempo (2 decimals) and its key.\n"
             "  A directory prints a FILE/BPM/KEY table, then a note for anything that failed.\n"
-            "  --nokey drops the key column and skips that pass.\n"
+            "  --bpmonly drops the key column and skips that pass.\n"
+            "  --keyonly drops the tempo fields and skips the BPM pipeline.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1586,8 +1611,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="HZ",
         help="analysis sample rate (default: %(default)s)",
     )
-    parser.add_argument(
-        "--nokey", action="store_true", help="skip key detection (BPM only)"
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--bpmonly", action="store_true", help="run only the BPM pass (skip key detection)"
+    )
+    modes.add_argument(
+        "--keyonly", action="store_true", help="run only the key pass (skip the BPM pipeline)"
     )
     parser.add_argument("-V", "--version", action="version", version=f"rba.py {__version__}")
     return parser
@@ -1602,25 +1631,32 @@ def display_width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
 
 
-def render_table(rows: list[tuple[str, str, str]], show_key: bool) -> str:
+def render_table(rows: list[tuple[str, str, str]], show_bpm: bool, show_key: bool) -> str:
     """Render the ``FILE / BPM / KEY`` table as plain aligned columns.
 
     The name column is sized in *display* columns (not characters) so CJK file
     names line up; the other columns are ASCII. Trailing padding is stripped.
+    ``show_bpm`` / ``show_key`` drop the corresponding column (``--keyonly`` /
+    ``--bpmonly``).
     """
     if not rows:
         return ""
     name_w = max(display_width("FILE"), *(display_width(n) for n, _, _ in rows))
-    bpm_w = max(len("BPM"), *(len(b) for _, b, _ in rows))
-    key_w = max(len("KEY"), *(len(k) for _, _, k in rows))
+    # Widths are computed even for hidden columns; they are simply unused.
+    bpm_w = max([len("BPM")] + [len(b) for _, b, _ in rows])
+    key_w = max([len("KEY")] + [len(k) for _, _, k in rows])
 
     def line(name: str, bpm: str, key: str) -> str:
-        out = f"{name}{' ' * (name_w - display_width(name))}  {bpm:>{bpm_w}}"
+        out = f"{name}{' ' * (name_w - display_width(name))}"
+        if show_bpm:
+            out += f"  {bpm:>{bpm_w}}"
         if show_key:
             out += f"  {key:<{key_w}}"
         return out.rstrip()
 
-    rule = "-" * name_w + "  " + "-" * bpm_w
+    rule = "-" * name_w
+    if show_bpm:
+        rule += "  " + "-" * bpm_w
     if show_key:
         rule += "  " + "-" * key_w
     out = [line("FILE", "BPM", "KEY"), rule]
@@ -1635,12 +1671,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if path.is_file():
         try:
-            result = analyze_file(path, args.sample_rate, not args.nokey)
+            result = analyze_file(
+                path, args.sample_rate, not args.keyonly, not args.bpmonly
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced as a clean CLI error
             print(f"rba.py: {exc}", file=sys.stderr)
             return EXIT_RUNTIME
-        tail = f"\tKEY: {result.key}" if result.key is not None else ""
-        print(f"{result.name}\tBPM: {result.bpm:.2f}{tail}")
+        fields = []
+        if result.bpm is not None:
+            fields.append(f"BPM: {result.bpm:.2f}")
+        if result.key is not None:
+            fields.append(f"KEY: {result.key}")
+        print(f"{result.name}\t{'\t'.join(fields)}" if fields else result.name)
         print(detail_lines(result), file=sys.stderr, end="")
         return EXIT_OK
 
@@ -1649,7 +1691,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rba.py: no audio files found in {path}", file=sys.stderr)
         return EXIT_RUNTIME
 
-    find_key = not args.nokey
+    find_bpm = not args.keyonly
+    find_key = not args.bpmonly
     rows: list[tuple[str, str, str]] = []
     failures: list[tuple[str, str]] = []
     # `disable=None` silences the bar when stderr is not a TTY, matching the
@@ -1658,17 +1701,20 @@ def main(argv: list[str] | None = None) -> int:
     for f in bar:
         bar.set_postfix_str(f.name, refresh=False)
         try:
-            result = analyze_file(f, args.sample_rate, find_key)
+            result = analyze_file(f, args.sample_rate, find_bpm, find_key)
         except Exception as exc:  # noqa: BLE001 - one bad file must not abort the run
             rows.append((f.name, "FAILED", "-"))
             failures.append((f.name, str(exc)))
             continue
-        rows.append((result.name, f"{result.bpm:.2f}", result.key or "-"))
+        # In --keyonly mode the BPM column is hidden; "-" keeps the row tuple
+        # well-formed anyway.
+        bpm_cell = f"{result.bpm:.2f}" if result.bpm is not None else "-"
+        rows.append((result.name, bpm_cell, result.key or "-"))
         if args.verbose:
             # Go through tqdm so the bar is cleared before each block.
             bar.write(detail_lines(result).rstrip("\n"), file=sys.stderr)
 
-    print(render_table(rows, find_key))
+    print(render_table(rows, find_bpm, find_key))
 
     if failures:
         print(f"\n{len(failures)} file{'s' if len(failures) != 1 else ''} could not be analyzed:")

@@ -20,7 +20,8 @@ Arguments:
 
 Options:
   -v, --verbose           Print pipeline detail to stderr
-      --nokey             Skip key detection (BPM only)
+      --bpmonly           Run only the BPM pass (skip key detection)
+      --keyonly           Run only the key pass (skip the BPM pipeline)
   -r, --recursive         Recurse into subdirectories when PATH is a directory
       --ffmpeg <PATH>     ffmpeg executable to use [env: RBA_FFMPEG=]
       --sample-rate <HZ>  Analysis sample rate in Hz [env: RBA_SAMPLE_RATE=] [default: 44100]
@@ -30,7 +31,7 @@ Options:
 
 * **A file** prints the file name, its tempo (2 decimals) and its key.
 * **A directory** prints a `FILE / BPM / KEY` table, sorted, skipping macOS `._*` files, with a progress bar on a terminal.
-* `--nokey` drops the key column and skips that analysis. Files are analysed **in parallel**; a file that fails to decode shows `FAILED` and its reason below the table, without aborting the run.
+* `--bpmonly` drops the key column and skips that pass; `--keyonly` drops the tempo fields and skips the BPM pipeline. The two conflict (usage error, exit 2). Files are analysed **in parallel**; a file that fails to decode shows `FAILED` and its reason below the table, without aborting the run.
 
 ### Environment
 
@@ -85,7 +86,7 @@ PCM ─> low-pass ~2 kHz          161-tap windowed sinc
     KEY
 ```
 
-Key detection is on by default; `--nokey` skips it and drops the `KEY` column.
+Key detection is on by default; `--bpmonly` skips it (drops the `KEY` column), `--keyonly` runs only it (drops the `BPM` fields — the tempo pipeline is skipped entirely).
 
 ## Python reference implementation
 
@@ -100,7 +101,7 @@ pip install librosa numpy scipy tqdm
 ### Usage
 
 ```
-usage: rba.py [-h] [-v] [-r] [--sample-rate HZ] [--nokey] [-V] PATH
+usage: rba.py [-h] [-v] [-r] [--sample-rate HZ] [--bpmonly | --keyonly] [-V] PATH
 
 BPM & key analyzer — Python reference implementation of the MixMeister BPM Analyzer core and of the libKeyFinder key detector.
 
@@ -112,6 +113,7 @@ options:
   -v, --verbose     print pipeline detail to stderr
   -r, --recursive   recurse into subdirectories when PATH is a directory
   --sample-rate HZ  analysis sample rate (default: 44100)
-  --nokey           skip key detection (BPM only)
+  --bpmonly         run only the BPM pass (skip key detection)
+  --keyonly         run only the key pass (skip the BPM pipeline)
   -V, --version     show program's version number and exit
 ```

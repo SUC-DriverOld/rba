@@ -33,7 +33,8 @@ const AFTER_HELP: &str = "\
 OUTPUT:
     A single file names the file, its tempo (2 decimals) and its key.
     A directory prints a FILE/BPM/KEY table, then a note for anything that failed.
-    --nokey drops the key column and skips that pass.
+    --bpmonly drops the key column and skips that pass.
+    --keyonly drops the tempo fields and skips the BPM pipeline.
 
 ENVIRONMENT:
     RBA_FFMPEG           ffmpeg executable        (alias: rba_ffmpeg)
@@ -57,9 +58,13 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Skip key detection (BPM only)
-    #[arg(long)]
-    pub nokey: bool,
+    /// Run only the BPM pass (skip key detection)
+    #[arg(long, conflicts_with = "keyonly")]
+    pub bpmonly: bool,
+
+    /// Run only the key pass (skip the BPM pipeline)
+    #[arg(long, conflicts_with = "bpmonly")]
+    pub keyonly: bool,
 
     /// Recurse into subdirectories when PATH is a directory
     #[arg(short, long)]
@@ -102,7 +107,8 @@ impl Cli {
             self.ffprobe.clone(),
             self.sample_rate,
             self.verbose,
-            !self.nokey,
+            !self.keyonly,
+            !self.bpmonly,
         )
     }
 }
@@ -250,7 +256,7 @@ fn run_directory(dir: &Path, cfg: &Config, recursive: bool) -> Result<ExitCode> 
         }
     }
 
-    print!("{}", report::render_table(&rows, cfg.find_key));
+    print!("{}", report::render_table(&rows, cfg.find_bpm, cfg.find_key));
 
     let failed = rows
         .iter()

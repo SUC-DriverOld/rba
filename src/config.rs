@@ -26,7 +26,9 @@ pub struct Config {
     pub sample_rate: u32,
     /// Emit extra detail on stderr.
     pub verbose: bool,
-    /// Run the key pass. On by default; `--nokey` turns it off.
+    /// Run the BPM pipeline. On by default; `--keyonly` turns it off.
+    pub find_bpm: bool,
+    /// Run the key pass. On by default; `--bpmonly` turns it off.
     pub find_key: bool,
 }
 
@@ -36,6 +38,7 @@ impl Config {
         ffprobe: Option<PathBuf>,
         sample_rate: u32,
         verbose: bool,
+        find_bpm: bool,
         find_key: bool,
     ) -> Self {
         Config {
@@ -47,6 +50,7 @@ impl Config {
                 sample_rate
             },
             verbose,
+            find_bpm,
             find_key,
         }
     }
@@ -63,6 +67,6 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config::new(None, None, DEFAULT_SAMPLE_RATE, false, false)
+        Config::new(None, None, DEFAULT_SAMPLE_RATE, false, true, false)
     }
 }

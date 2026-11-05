@@ -24,15 +24,15 @@ pub struct Analysis {
     /// Detected tempo in BPM.
     ///
     /// `f64` for display convenience; the chain stage computes in `f32` like
-    /// the original.
-    pub bpm: f64,
+    /// the original. `None` when `--keyonly` skipped the BPM pipeline.
+    pub bpm: Option<f64>,
     /// PCM samples after decode/resample.
     pub sample_count: i64,
     /// Analysis sample rate.
     pub sample_rate: u32,
     /// Duration in seconds.
     pub duration: f64,
-    /// libKeyFinder key name, e.g. `"G major"`; `None` when `--nokey` was given.
+    /// libKeyFinder key name, e.g. `"G major"`; `None` when `--bpmonly` was given.
     pub key: Option<String>,
     /// Intermediate values, for `--verbose` and tests.
     pub trace: Trace,
@@ -59,42 +59,76 @@ pub struct Trace {
 }
 
 /// Analyse an already-decoded mono buffer.
-pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Analysis {
+///
+/// `find_bpm` gates the tempo pipeline (stages ②–⑧), `find_key` the
+/// libKeyFinder pass. Skipping a pass leaves its `Analysis` field `None`
+/// and its trace values at their defaults.
+pub fn analyze_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    find_bpm: bool,
+    find_key: bool,
+) -> Analysis {
     let total_samples = samples.len() as i64;
-
-    // ── ② spectral thumbnail (v30) ──────────────────────────────────────
-    let spec = thumbnail::spec_thumbnail(samples, sample_rate);
-
-    // ── ③ peak-hold envelope (v33) ──────────────────────────────────────
-    let mut peak = spec.clone();
-    thumbnail::peak_hold(&mut peak);
-
-    // ── ④ onsets for the tempo histogram (divisor 4) ────────────────────
-    let ip: ImpactPoints = impact::build_impact_points(&peak, total_samples, 4);
-
-    // ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ────────────────
-    let base_bpm = detect::detect_base_bpm(&ip);
-
-    // ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─────
-    // The DLL smooths a copy of the *note-detector* thumbnail (filtered
-    // waveform peaks), not the spectral one.
-    let note = thumbnail::note_peak_thumbnail(samples, sample_rate);
-    let ipc = impact::build_impact_points_classic(&thumbnail::smoothed(&note), total_samples, 4);
-    let folded_bpm = detect::fold_up_bpm(&ipc, base_bpm);
-
-    // ── ⑦ short-clip override — a prior, not a verdict: the chain still
-    // runs below and can confirm (or, with content, refine) it ──────────
-    let prior = detect::short_clip_bpm_update(total_samples, sample_rate, folded_bpm);
-    let is_short = sample_rate != 0 && 30 * sample_rate as i64 > total_samples;
-
-    // ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────────
-    let onsets8 = impact::build_impact_points(&peak, total_samples, 8);
-    let mut chain = ChainTrace::default();
-    let bpm = beatchain::beat_chain_bpm(&spec, &onsets8, prior, sample_rate, &mut chain);
 
     // ── ⑩ key: the libKeyFinder chain (spec §13) ───────────────────────
     let key = find_key.then(|| keyfinder::detect_key(samples, sample_rate));
     let key_detected = key.clone().unwrap_or_else(|| "not requested".to_string());
+
+    // ── ②–⑧ the tempo pipeline, in BuildProfile order ──────────────────
+    let (bpm, trace) = if find_bpm {
+        // ── ② spectral thumbnail (v30) ──────────────────────────────────
+        let spec = thumbnail::spec_thumbnail(samples, sample_rate);
+
+        // ── ③ peak-hold envelope (v33) ──────────────────────────────────
+        let mut peak = spec.clone();
+        thumbnail::peak_hold(&mut peak);
+
+        // ── ④ onsets for the tempo histogram (divisor 4) ────────────────
+        let ip: ImpactPoints = impact::build_impact_points(&peak, total_samples, 4);
+
+        // ── ⑤ initial tempo: median of 9 windows × {÷4, ÷8} ────────────
+        let base_bpm = detect::detect_base_bpm(&ip);
+
+        // ── ⑥ half-tempo fold — onsets from the smoothed note thumbnail ─
+        // The DLL smooths a copy of the *note-detector* thumbnail (filtered
+        // waveform peaks), not the spectral one.
+        let note = thumbnail::note_peak_thumbnail(samples, sample_rate);
+        let ipc =
+            impact::build_impact_points_classic(&thumbnail::smoothed(&note), total_samples, 4);
+        let folded_bpm = detect::fold_up_bpm(&ipc, base_bpm);
+
+        // ── ⑦ short-clip override — a prior, not a verdict: the chain
+        // still runs below and can confirm (or, with content, refine) it ─
+        let prior = detect::short_clip_bpm_update(total_samples, sample_rate, folded_bpm);
+        let is_short = sample_rate != 0 && 30 * sample_rate as i64 > total_samples;
+
+        // ── ⑧ final BPM: BuildBeatPointsAlt → ClusterFilterPoints ───────
+        let onsets8 = impact::build_impact_points(&peak, total_samples, 8);
+        let mut chain = ChainTrace::default();
+        let bpm = beatchain::beat_chain_bpm(&spec, &onsets8, prior, sample_rate, &mut chain);
+
+        (
+            Some(bpm as f64),
+            Trace {
+                thumbnail_elements: spec.len(),
+                peak_hold_decay_div: peak.ele_per_meas(164.0) >> 4,
+                onset_count: ip.len(),
+                base_bpm,
+                classic_onset_count: ipc.len(),
+                folded_bpm,
+                chain_onset_count: onsets8.len(),
+                short_clip_applied: is_short,
+                chain,
+                key_detected: key_detected.clone(),
+            },
+        )
+    } else {
+        (None, Trace {
+            key_detected,
+            ..Trace::default()
+        })
+    };
 
     let duration = if sample_rate == 0 {
         0.0
@@ -104,23 +138,12 @@ pub fn analyze_samples(samples: &[f32], sample_rate: u32, find_key: bool) -> Ana
 
     Analysis {
         name: String::new(),
-        bpm: bpm as f64,
+        bpm,
         sample_count: total_samples,
         sample_rate,
         duration,
         key,
-        trace: Trace {
-            thumbnail_elements: spec.len(),
-            peak_hold_decay_div: peak.ele_per_meas(164.0) >> 4,
-            onset_count: ip.len(),
-            base_bpm,
-            classic_onset_count: ipc.len(),
-            folded_bpm,
-            chain_onset_count: onsets8.len(),
-            short_clip_applied: is_short,
-            chain,
-            key_detected,
-        },
+        trace,
     }
 }
 
@@ -130,7 +153,7 @@ pub fn analyze_file(path: &Path, cfg: &Config) -> Result<Analysis> {
     if samples.len() < FFT_SIZE {
         return Err(Error::EmptyAudio(path.to_path_buf()));
     }
-    let mut a = analyze_samples(&samples, cfg.sample_rate, cfg.find_key);
+    let mut a = analyze_samples(&samples, cfg.sample_rate, cfg.find_bpm, cfg.find_key);
     a.name = display_name(path);
     Ok(a)
 }
@@ -154,13 +177,13 @@ mod tests {
     #[test]
     fn silence_does_not_panic() {
         let samples = vec![0f32; 44100 * 5];
-        let a = analyze_samples(&samples, 44100, false);
-        assert!(a.bpm.is_finite(), "bpm = {}", a.bpm);
+        let a = analyze_samples(&samples, 44100, true, false);
+        assert!(a.bpm.unwrap().is_finite());
     }
 
     #[test]
     fn empty_buffer_is_safe() {
-        let a = analyze_samples(&[], 44100, false);
+        let a = analyze_samples(&[], 44100, true, false);
         assert_eq!(a.sample_count, 0);
         assert_eq!(a.trace.thumbnail_elements, 0);
     }

@@ -12,66 +12,77 @@ const COLUMN_GAP: &str = "  ";
 
 /// Print one analysis result.
 ///
-/// Names the file and labels the unit: a bare number on its own is easy to
-/// misread, especially when the command was run a while ago.
+/// Names the file and labels the units: a bare number on its own is easy to
+/// misread, especially when the command was run a while ago. Fields that were
+/// not computed (`--keyonly` drops BPM, `--bpmonly` drops KEY) are absent.
 pub fn print_single(a: &Analysis) {
-    // The KEY field is absent only when --nokey suppressed the key pass.
-    let tail = match &a.key {
-        Some(key) => format!("\tKEY: {key}"),
-        None => String::new(),
-    };
-    if !a.name.is_empty() {
-        println!("{}\tBPM: {:.2}{}", a.name, a.bpm, tail);
-    } else {
-        println!("BPM: {:.2}{}", a.bpm, tail);
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(bpm) = a.bpm {
+        fields.push(format!("BPM: {bpm:.2}"));
     }
+    if let Some(key) = &a.key {
+        fields.push(format!("KEY: {key}"));
+    }
+    let prefix = if a.name.is_empty() {
+        String::new()
+    } else {
+        format!("{}\t", a.name)
+    };
+    println!("{prefix}{}", fields.join("\t"));
     eprint!("{}", details(a));
 }
 
 /// Human-readable breakdown, written to stderr.
+///
+/// Only the passes that ran are shown: with `--keyonly` the tempo lines are
+/// absent (their trace values are defaults, not measurements).
 pub fn details(a: &Analysis) -> String {
-    let c = &a.trace.chain;
-    format!(
+    let mut s = format!(
         "  file            : {}\n\
-         \x20 samples         : {} ({:.2} s @ {} Hz)\n\
-         \x20 thumbnail elems : {}\n\
-         \x20 peak-hold decay : {}\n\
-         \x20 onsets (slope)  : {}\n\
-         \x20 onsets (classic): {}\n\
-         \x20 onsets (chain)  : {}\n\
-         \x20 base BPM (0.1)  : {:.2}\n\
-         \x20 after fold-up   : {:.2}\n\
-         \x20 short-clip rule : {}\n\
-         \x20 chain unit0     : {:.2}\n\
-         \x20 chain interval  : {:.4}\n\
-         \x20 chain conns     : {}/{} (coverage {:.2})\n\
-         \x20 beat chain      : {:.4} samples/eighth\n\
-         \x20                 : {} chains kept, best {} pts\n\
-         \x20 final BPM       : {:.2}\n\
-         \x20 key (findkey)   : {}\n",
-        a.name,
-        a.sample_count,
-        a.duration,
-        a.sample_rate,
-        a.trace.thumbnail_elements,
-        a.trace.peak_hold_decay_div,
-        a.trace.onset_count,
-        a.trace.classic_onset_count,
-        a.trace.chain_onset_count,
-        a.trace.base_bpm,
-        a.trace.folded_bpm,
-        if a.trace.short_clip_applied { "applied" } else { "n/a" },
-        c.unit0,
-        c.interval_est,
-        c.processed,
-        c.candidates,
-        c.coverage,
-        c.io_i,
-        c.chains_kept,
-        c.best_members,
-        a.bpm,
-        a.trace.key_detected,
-    )
+         \x20 samples         : {} ({:.2} s @ {} Hz)\n",
+        a.name, a.sample_count, a.duration, a.sample_rate,
+    );
+    if let Some(bpm) = a.bpm {
+        let c = &a.trace.chain;
+        s.push_str(&format!(
+            "  thumbnail elems : {}\n\
+             \x20 peak-hold decay : {}\n\
+             \x20 onsets (slope)  : {}\n\
+             \x20 onsets (classic): {}\n\
+             \x20 onsets (chain)  : {}\n\
+             \x20 base BPM (0.1)  : {:.2}\n\
+             \x20 after fold-up   : {:.2}\n\
+             \x20 short-clip rule : {}\n\
+             \x20 chain unit0     : {:.2}\n\
+             \x20 chain interval  : {:.4}\n\
+             \x20 chain conns     : {}/{} (coverage {:.2})\n\
+             \x20 beat chain      : {:.4} samples/eighth\n\
+             \x20                 : {} chains kept, best {} pts\n\
+             \x20 final BPM       : {:.2}\n",
+            a.trace.thumbnail_elements,
+            a.trace.peak_hold_decay_div,
+            a.trace.onset_count,
+            a.trace.classic_onset_count,
+            a.trace.chain_onset_count,
+            a.trace.base_bpm,
+            a.trace.folded_bpm,
+            if a.trace.short_clip_applied { "applied" } else { "n/a" },
+            c.unit0,
+            c.interval_est,
+            c.processed,
+            c.candidates,
+            c.coverage,
+            c.io_i,
+            c.chains_kept,
+            c.best_members,
+            bpm,
+        ));
+    }
+    s.push_str(&format!(
+        "  key (findkey)   : {}\n",
+        a.trace.key_detected
+    ));
+    s
 }
 
 /// One row of the directory report.
@@ -92,7 +103,10 @@ impl Row {
 
 fn bpm_cell(row: &Row) -> String {
     match row {
-        Row::Ok(a) => format!("{:.2}", a.bpm),
+        Row::Ok(a) => match a.bpm {
+            Some(bpm) => format!("{bpm:.2}"),
+            None => "-".to_string(),
+        },
         Row::Failed { .. } => "FAILED".to_string(),
     }
 }
@@ -116,9 +130,10 @@ fn pad_left(s: &str, width: usize) -> String {
     format!("{}{s}", " ".repeat(width.saturating_sub(s.width())))
 }
 
-/// Render the directory report: a plain `FILE / BPM` table, plus a short list of
-/// reasons underneath if anything failed.
-pub fn render_table(rows: &[Row], show_key: bool) -> String {
+/// Render the directory report: an aligned `FILE / BPM / KEY` table, plus a
+/// short list of reasons underneath if anything failed. `show_bpm` / `show_key`
+/// drop the corresponding column (`--keyonly` / `--bpmonly`).
+pub fn render_table(rows: &[Row], show_bpm: bool, show_key: bool) -> String {
     let name_w = rows
         .iter()
         .map(|r| r.name().width())
@@ -127,6 +142,7 @@ pub fn render_table(rows: &[Row], show_key: bool) -> String {
         .unwrap_or(HEADER_FILE.len());
     let bpm_w = rows
         .iter()
+        .filter(|_| show_bpm)
         .map(|r| bpm_cell(r).width())
         .chain(std::iter::once(HEADER_BPM.width()))
         .max()
@@ -134,6 +150,7 @@ pub fn render_table(rows: &[Row], show_key: bool) -> String {
 
     let key_w = rows
         .iter()
+        .filter(|_| show_key)
         .map(|r| key_cell(r).width())
         .chain(std::iter::once(HEADER_KEY.width()))
         .max()
@@ -142,11 +159,11 @@ pub fn render_table(rows: &[Row], show_key: bool) -> String {
     // Trailing padding is stripped so the output matches the Python reference
     // byte for byte.
     let row_line = |name: &str, bpm: &str, key: &str| {
-        let mut line = format!(
-            "{}{COLUMN_GAP}{}",
-            pad_right(name, name_w),
-            pad_left(bpm, bpm_w)
-        );
+        let mut line = pad_right(name, name_w);
+        if show_bpm {
+            line.push_str(COLUMN_GAP);
+            line.push_str(&pad_left(bpm, bpm_w));
+        }
         if show_key {
             line.push_str(COLUMN_GAP);
             line.push_str(&pad_right(key, key_w));
@@ -157,7 +174,11 @@ pub fn render_table(rows: &[Row], show_key: bool) -> String {
     let mut out = String::new();
     out.push_str(&row_line(HEADER_FILE, HEADER_BPM, HEADER_KEY));
     out.push('\n');
-    let mut rule = format!("{}{COLUMN_GAP}{}", "-".repeat(name_w), "-".repeat(bpm_w));
+    let mut rule = "-".repeat(name_w);
+    if show_bpm {
+        rule.push_str(COLUMN_GAP);
+        rule.push_str(&"-".repeat(bpm_w));
+    }
     if show_key {
         rule.push_str(COLUMN_GAP);
         rule.push_str(&"-".repeat(key_w));
@@ -199,7 +220,7 @@ mod tests {
     fn mk(name: &str, bpm: f64) -> Analysis {
         Analysis {
             name: name.to_string(),
-            bpm,
+            bpm: Some(bpm),
             sample_count: 44100,
             sample_rate: 44100,
             duration: 1.0,
@@ -218,7 +239,7 @@ mod tests {
                 message: "decoder exploded".into(),
             },
         ];
-        let t = render_table(&rows, true);
+        let t = render_table(&rows, true, true);
         assert!(t.contains("FILE"));
         assert!(t.contains("BPM"));
         assert!(t.contains("120.00"));
@@ -232,7 +253,7 @@ mod tests {
     #[test]
     fn successful_run_has_no_failure_section() {
         let rows = vec![Row::Ok(mk("a.wav", 120.0))];
-        let t = render_table(&rows, true);
+        let t = render_table(&rows, true, true);
         assert!(!t.contains("FAILED"));
         assert!(!t.contains("could not be analyzed"));
     }
@@ -243,14 +264,14 @@ mod tests {
             name: "x.wav".into(),
             message: "boom".into(),
         }];
-        let t = render_table(&rows, true);
+        let t = render_table(&rows, true, true);
         assert!(t.contains("1 file could not be analyzed"), "{t}");
     }
 
     #[test]
     fn the_rule_matches_the_column_widths() {
         let rows = vec![Row::Ok(mk("a.wav", 120.0))];
-        let rendered = render_table(&rows, true);
+        let rendered = render_table(&rows, true, true);
         let lines: Vec<&str> = rendered.lines().collect();
         // Header, rule, one row.
         assert_eq!(lines.len(), 3);
@@ -270,12 +291,36 @@ mod tests {
     }
 
     #[test]
+    fn keyonly_table_drops_the_bpm_column() {
+        let mut a = mk("a.wav", 0.0);
+        a.bpm = None;
+        let rows = vec![Row::Ok(a)];
+        let t = render_table(&rows, false, true);
+        assert!(t.contains("FILE"), "{t}");
+        assert!(t.contains("KEY"), "{t}");
+        assert!(!t.contains("BPM"), "{t}");
+        let lines: Vec<&str> = t.lines().collect();
+        // The name column is still sized by the widest name ("a.wav" = 5), so
+        // the header keeps its intra-line padding: `FILE ` + gap + `KEY`.
+        assert_eq!(lines[0].trim_end(), "FILE   KEY", "{t}");
+        assert_eq!(lines[2].trim_end(), "a.wav  C minor", "{t}");
+    }
+
+    #[test]
+    fn bpmonly_table_drops_the_key_column() {
+        let rows = vec![Row::Ok(mk("a.wav", 120.0))];
+        let t = render_table(&rows, true, false);
+        assert!(t.contains("BPM"), "{t}");
+        assert!(!t.contains("KEY"), "{t}");
+    }
+
+    #[test]
     fn columns_align_across_rows() {
         let rows = vec![
             Row::Ok(mk("short.wav", 90.0)),
             Row::Ok(mk("a_much_longer_name.wav", 120.25)),
         ];
-        let rendered = render_table(&rows, true);
+        let rendered = render_table(&rows, true, true);
         let lines: Vec<&str> = rendered.lines().collect();
         // BPM is right-aligned, so every value ends in the same column.
         let bpm_end = lines[0].find("BPM").expect("header has BPM") + "BPM".len();
