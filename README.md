@@ -23,7 +23,6 @@ Options:
       --bpmonly           Run only the BPM pass (skip key detection)
       --keyonly           Run only the key pass (skip the BPM pipeline)
   -r, --recursive         Recurse into subdirectories when PATH is a directory
-      --ffmpeg <PATH>     ffmpeg executable to use [env: RBA_FFMPEG=]
       --sample-rate <HZ>  Analysis sample rate in Hz [env: RBA_SAMPLE_RATE=] [default: 44100]
   -h, --help              Print help
   -V, --version           Print version
@@ -37,11 +36,13 @@ Options:
 
 | Variable | Alias | Default | Purpose |
 | --- | --- | --- | --- |
-| `RBA_FFMPEG` | `rba_ffmpeg` | `ffmpeg` | ffmpeg executable |
-| `RBA_FFPROBE` | `rba_ffprobe` | `ffprobe` | source format info in `--verbose` |
+| `RBA_USE_FFMPEG` | `rba_use_ffmpeg` | unset | decode with the external ffmpeg instead of the built-in Symphonia engine (flag: any value except `0`/`false`/`no`/`off`) |
+| `RBA_FFMPEG` | `rba_ffmpeg` | `ffmpeg` | ffmpeg executable for that backend |
 | `RBA_SAMPLE_RATE` | `rba_sample_rate` | `44100` | analysis sample rate — leave alone unless experimenting |
 
-Command-line options take precedence over the environment.
+### Audio decoding
+
+Decoding uses the built-in [Symphonia](https://github.com/pdeljanov/Symphonia) engine (wav/aiff/flac/alac/mp3/aac/vorbis/ogg/mp4/mkv, resampled to 44100 Hz with `rubato`) — no external dependencies. Set `RBA_USE_FFMPEG=1` to switch to an external `ffmpeg` (path via `RBA_FFMPEG`), which additionally covers formats Symphonia has no codec for (wma, ape, wv, dsf, …). Both backends fold multichannel to mono with a plain channel sum, matching the original analyzer's PCM reader.
 
 ## How it works
 

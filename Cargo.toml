@@ -17,6 +17,17 @@ path = "src/lib.rs"
 [dependencies]
 # CLI parsing: args, --help/--version, usage errors, env fallbacks.
 clap = { version = "4.5.61", features = ["derive", "env"] }
+# Default decoder: pure-Rust demux + codec support for the common formats.
+# Feature list = the formats the CLI's audio allow-list actually covers with
+# a Symphonia codec (wma/ape/wv/... have no Symphonia decoder; those still
+# need the ffmpeg fallback via RBA_USE_FFMPEG).
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav",
+    "adpcm", "mkv",
+] }
+# Resampler for the Symphonia path (the original resamples to 44100 via the
+# OS audio stack; ffmpeg has its own resampler built in).
+rubato = "0.16" 
 # Progress bar for directory mode (stderr, TTY only).
 indicatif = "0.18.4"
 # Parallel analysis of many files.

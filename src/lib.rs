@@ -19,7 +19,8 @@
 //! `indicatif` (progress), `rayon` (parallel files), `walkdir` (traversal),
 //! `unicode-width` (table alignment), `rustfft` (FFT), `thiserror` (errors).
 //! The directory report is drawn by hand — a header, a dashed rule, one line
-//! per file. Decoding is delegated to the external `ffmpeg` binary.
+//! per file. Decoding uses the built-in Symphonia engine; the external
+//! `ffmpeg` backend is opt-in via `RBA_USE_FFMPEG`.
 
 pub mod analyze;
 pub mod audio;

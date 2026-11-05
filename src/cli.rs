@@ -37,8 +37,9 @@ OUTPUT:
     --keyonly drops the tempo fields and skips the BPM pipeline.
 
 ENVIRONMENT:
+    RBA_USE_FFMPEG       decode with ffmpeg instead of the built-in engine
+                         (flag; aliases: rba_use_ffmpeg)
     RBA_FFMPEG           ffmpeg executable        (alias: rba_ffmpeg)
-    RBA_FFPROBE          ffprobe executable       (alias: rba_ffprobe)
     RBA_SAMPLE_RATE      analysis rate in Hz      (alias: rba_sample_rate)";
 
 /// BPM & key analyzer — the MixMeister BPM Analyzer core plus libKeyFinder.
@@ -70,14 +71,6 @@ pub struct Cli {
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// ffmpeg executable to use
-    #[arg(long, value_name = "PATH", env = "RBA_FFMPEG")]
-    pub ffmpeg: Option<PathBuf>,
-
-    /// ffprobe executable to use (diagnostics only)
-    #[arg(long, value_name = "PATH", env = "RBA_FFPROBE", hide = true)]
-    pub ffprobe: Option<PathBuf>,
-
     /// Analysis sample rate in Hz
     #[arg(
         long,
@@ -100,11 +93,10 @@ fn parse_existing_path(s: &str) -> std::result::Result<PathBuf, String> {
 }
 
 impl Cli {
-    /// Resolve the analysis configuration from the parsed options.
+    /// Resolve the analysis configuration from the parsed options. Decoder
+    /// settings (`RBA_USE_FFMPEG`, `RBA_FFMPEG`) are read by `Config::new`.
     pub fn config(&self) -> Config {
         Config::new(
-            self.ffmpeg.clone(),
-            self.ffprobe.clone(),
             self.sample_rate,
             self.verbose,
             !self.keyonly,
@@ -173,7 +165,7 @@ fn make_progress(total: usize, cfg: &Config) -> Option<ProgressBar> {
 pub fn normalize_env_aliases() {
     for (lower, upper) in [
         ("rba_ffmpeg", "RBA_FFMPEG"),
-        ("rba_ffprobe", "RBA_FFPROBE"),
+        ("rba_use_ffmpeg", "RBA_USE_FFMPEG"),
         ("rba_sample_rate", "RBA_SAMPLE_RATE"),
     ] {
         if std::env::var_os(upper).is_none() {
@@ -336,10 +328,42 @@ mod tests {
 
     #[test]
     fn config_falls_back_to_bare_program_names() {
+        // RBA_FFMPEG/RBA_USE_FFMPEG are absent in the test environment unless
+        // the developer happens to have them set; guard for determinism.
         let c = parse(&["Cargo.toml"]).unwrap();
-        let cfg = c.config();
+        let cfg = {
+            let _guard = env_guard(&["RBA_FFMPEG", "RBA_USE_FFMPEG", "rba_ffmpeg", "rba_use_ffmpeg"]);
+            c.config()
+        };
         assert_eq!(cfg.ffmpeg_path(), Path::new("ffmpeg"));
-        assert_eq!(cfg.ffprobe_path(), Path::new("ffprobe"));
+        assert!(!cfg.use_ffmpeg);
+    }
+
+    /// Temporarily remove the named env vars for the enclosed scope (tests
+    /// only; the process env is otherwise shared between parallel tests, so
+    /// this is best-effort).
+    struct EnvRestore(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn env_guard(names: &[&str]) -> EnvRestore {
+        let saved = names
+            .iter()
+            .map(|n| (n.to_string(), std::env::var_os(n)))
+            .collect::<Vec<_>>();
+        for n in names {
+            std::env::remove_var(n);
+        }
+        EnvRestore(saved)
     }
 
     #[test]
